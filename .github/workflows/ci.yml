@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # Omarchy is Arch-based; this gets the same Qt 6 (qmlformat), bash and
+    # coreutils the plugin runs with.
+    name: Tests, lint, QML parse, manifest (Arch Linux)
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    timeout-minutes: 15
+    steps:
+      - name: Install tools
+        run: |
+          pacman -Syu --noconfirm --needed bash coreutils util-linux systemd tar curl git jq nodejs python qt6-declarative uv
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run tests/check.sh as a normal user
+        # The helper refuses to install od-sender as root, so don't test as root.
+        run: |
+          useradd -m ci
+          chown -R ci:ci "$GITHUB_WORKSPACE"
+          runuser -u ci -- env HOME=/home/ci CI=true bash tests/check.sh
+
+  tests-minimum:
+    # The oldest supported runtimes: Python 3.11 (tomllib) and Node 20.
+    name: Tests (Ubuntu, Python 3.11, Node 20)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "20"
+      - name: Run the test suites
+        run: CI=true bash tests/check.sh --tests-only

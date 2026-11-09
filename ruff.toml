@@ -1,0 +1,6 @@
+# Lint config for the stdlib-only helpers in bin/ (python3 -I, Python >= 3.11 for tomllib).
+target-version = "py311"
+line-length = 120
+
+[lint]
+select = ["E", "F", "W", "B", "UP", "PLW1510"]
