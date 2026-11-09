@@ -1,0 +1,44 @@
+{
+  "_comment": "Shared accept/reject corpus. tests/run.js checks Model.js against it and tests/helper.sh checks bin/ against it, so the JS, bash and Python rules can't drift apart.",
+  "ids": {
+    "valid": ["A0EC2343-F05E-4776-8903-8C62BB114896", "deadbeef", "0a0a0a0a-0", "ABCDEF0123456789"],
+    "invalid": ["", "-rf", "-a0ec2343", "a0ec234", "g0ec2343", "../../etc", "A0EC2343;rm", "A0EC2343 x", "$(id)", "--to=x", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+  },
+  "addrs": {
+    "valid": ["10.93.10.226:9000", "ipad.local:9000", "[fe80::1]:9000", "host:1", "host:65535"],
+    "invalid": ["", "-oProxy=x:9000", "10.0.0.1", "10.0.0.1:0", "10.0.0.1:65536", "a b:9000", "a;b:9000", "a\\b:9000", ":9000"]
+  },
+  "settings": [
+    { "scope": "receiver", "key": "bitrate-mbps", "value": "35", "ok": true },
+    { "scope": "receiver", "key": "bitrate-mbps", "value": "1", "ok": true },
+    { "scope": "receiver", "key": "bitrate-mbps", "value": "200", "ok": true },
+    { "scope": "receiver", "key": "bitrate-mbps", "value": "0", "ok": false },
+    { "scope": "receiver", "key": "bitrate-mbps", "value": "201", "ok": false },
+    { "scope": "receiver", "key": "bitrate-mbps", "value": "2.5", "ok": false },
+    { "scope": "receiver", "key": "bitrate-mbps", "value": "", "ok": true },
+    { "scope": "receiver", "key": "scale", "value": "passthrough", "ok": true },
+    { "scope": "receiver", "key": "scale", "value": "mac", "ok": true },
+    { "scope": "receiver", "key": "scale", "value": "1.5", "ok": true },
+    { "scope": "receiver", "key": "scale", "value": "4", "ok": true },
+    { "scope": "receiver", "key": "scale", "value": "1.3", "ok": false },
+    { "scope": "receiver", "key": "scale", "value": "9", "ok": false },
+    { "scope": "receiver", "key": "scale", "value": "x", "ok": false },
+    { "scope": "receiver", "key": "max-fps", "value": "60", "ok": false },
+    { "scope": "receiver", "key": "position", "value": "auto-right", "ok": false },
+    { "scope": "global", "key": "max-fps", "value": "60", "ok": true },
+    { "scope": "global", "key": "max-fps", "value": "240", "ok": true },
+    { "scope": "global", "key": "max-fps", "value": "0", "ok": false },
+    { "scope": "global", "key": "max-fps", "value": "999", "ok": false },
+    { "scope": "global", "key": "encoder", "value": "openh264", "ok": true },
+    { "scope": "global", "key": "encoder", "value": "nvenc", "ok": false },
+    { "scope": "global", "key": "cursor", "value": "off", "ok": true },
+    { "scope": "global", "key": "cursor", "value": "hidden", "ok": false },
+    { "scope": "global", "key": "tailscale", "value": "false", "ok": true },
+    { "scope": "global", "key": "tailscale", "value": "yes", "ok": false },
+    { "scope": "global", "key": "bitrate-mbps", "value": "20", "ok": false },
+    { "scope": "global", "key": "position", "value": "auto-left", "ok": false },
+    { "scope": "global", "key": "workspace", "value": "3", "ok": false },
+    { "scope": "global", "key": "to", "value": "x", "ok": false },
+    { "scope": "global", "key": "capture", "value": "wlr", "ok": false }
+  ]
+}

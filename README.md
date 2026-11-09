@@ -69,7 +69,7 @@ No `sudo` or `pkexec`, ever.
 
 **Hosts it contacts.** Only `api.github.com`, `github.com` and `objects.githubusercontent.com`, over HTTPS (redirects must stay on HTTPS; 60 s timeout; release JSON capped at 1 MB and downloads at 50 MB):
 
-- Once a day (and when you open the panel, if the last check was over 6 hours ago) it asks `api.github.com` for the latest od-sender release, with an ETag so unchanged answers are cheap. Turn **Check GitHub daily for od-sender updates** off to stop this. With od-sender not installed, opening the panel also fetches the release so it can offer to install it.
+- Once a day (and when you open the panel, if the last check was over 6 hours ago) it asks `api.github.com` for the latest od-sender release, with an ETag so unchanged answers are cheap. The check is shared: every bar on every monitor reuses a cached answer younger than 6 hours, so GitHub is asked at most about once every 6 hours. Turn **Check GitHub daily for od-sender updates** off to stop this. With od-sender not installed, opening the panel also fetches the release so it can offer to install it.
 - When you click Install or Update it downloads the release tarball and its `.sha256` file from GitHub.
 
 **Files it writes.** `~/.config/opendisplay/sender.toml` (plus `sender.toml.bak`), od-sender's files via the official `install.sh` (`~/.local/bin/od-sender`, `~/.local/share/applications/od-sender.desktop`, `~/.config/systemd/user/od-sender@.service`), enabled auto-connect units under `~/.config/systemd/user/`, a cache in `~/.cache/omarchy-opendisplay/`, lock files in `$XDG_RUNTIME_DIR/omarchy-opendisplay/`, and a list of up to 16 recently used receivers (id, name, last address, time) in this widget's entry in `~/.config/omarchy/shell.json`.
@@ -127,6 +127,10 @@ CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull requ
 
 - **Arch Linux container:** the full `tests/check.sh` as a normal user, with the same Qt 6, bash and coreutils as Omarchy.
 - **Ubuntu with Python 3.11 and Node 20:** the test suites on the oldest supported runtimes.
+
+### Helper exit codes
+
+The helper's exit codes are part of its contract with the widget (for example 2 for an invalid argument, 8 when od-sender isn't installed, 11 when GitHub can't be reached). Run `bin/omarchy-opendisplay help` for the full list.
 
 ### Trying changes in the shell
 

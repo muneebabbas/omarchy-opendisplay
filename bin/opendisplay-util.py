@@ -5,6 +5,8 @@
   release FILE ARCH INSTALLED              check-update JSON from a GitHub release object
   verify-sha FILE SHAFILE DIGEST           check a download against .sha256 and the API digest
   check-tar FILE TOPDIR                    reject unsafe or unexpected tarball entries
+  install-plan                             status JSON on stdin -> EXTERNAL or "<kind> <unit> <to>" lines
+  template-installed                       exit 0 if od-sender's systemd template unit exists, else 1
 """
 
 import glob
@@ -22,6 +24,9 @@ TRANSIENT_RE = re.compile(r"^opendisplay-(addr-)?[0-9a-f]{8}\.service$")
 TEMPLATE_RE = re.compile(r"^od-sender@(.+)\.service$")
 VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 MAX_JSON = 1024 * 1024
+# The transient units' Description is "<DESC_PREFIX><to>"; bin/omarchy-opendisplay
+# sets it (DESC_PREFIX there) and units() parses it back. Keep the two in sync.
+DESC_PREFIX = "OpenDisplay to "
 
 
 def unescape_unit(text):
@@ -121,7 +126,7 @@ def units():
             to = unescape_unit(m.group(1))
         elif TRANSIENT_RE.match(uid):
             desc = props.get("Description", "")
-            to = desc[len("OpenDisplay to "):] if desc.startswith("OpenDisplay to ") else ""
+            to = desc[len(DESC_PREFIX):] if desc.startswith(DESC_PREFIX) else ""
         else:
             continue
         since = props.get("InactiveExitTimestamp", "").lstrip("@")
@@ -166,6 +171,25 @@ def cmd_status():
         "autoconnect": autoconnect(),
         "templateInstalled": template_installed(),
     }))
+    return 0
+
+
+def cmd_install_plan(text):
+    """EXTERNAL if a sender runs outside the plugin's units, else the units to restart."""
+    status = json.loads(text)
+    if any(x.get("unit") is None for x in status["sessions"]):
+        print("EXTERNAL")
+        return 0
+    for u in status["units"]:
+        if u["state"] not in ("active", "activating"):
+            continue
+        if u["template"]:
+            kind = "template"
+        elif u["unit"].startswith("opendisplay-addr-"):
+            kind = "addr"
+        else:
+            kind = "id"
+        print(kind, u["unit"], u["to"])
     return 0
 
 
@@ -216,6 +240,7 @@ def cmd_release(path, arch, installed):
         "sha256Url": sha.get("browser_download_url") if sha else None,
         "htmlUrl": html,
         "newer": cur is None or latest > cur,
+        "checkedAt": int(os.path.getmtime(path)),
     }
     for key in ("url", "sha256Url"):
         if out[key] is not None and not GH_DOWNLOAD.match(str(out[key])):
@@ -289,13 +314,17 @@ def main(argv):
     try:
         if argv[:1] == ["status"]:
             return cmd_status()
+        if argv == ["install-plan"]:
+            return cmd_install_plan(sys.stdin.read(MAX_JSON))
+        if argv == ["template-installed"]:
+            return 0 if template_installed() else 1
         if argv[:1] == ["release"] and len(argv) == 4:
             return cmd_release(argv[1], argv[2], argv[3])
         if argv[:1] == ["verify-sha"] and len(argv) == 4:
             return cmd_verify_sha(argv[1], argv[2], argv[3])
         if argv[:1] == ["check-tar"] and len(argv) == 3:
             return cmd_check_tar(argv[1], argv[2])
-    except (ValueError, OSError, json.JSONDecodeError) as e:
+    except (ValueError, OSError, KeyError, TypeError) as e:
         print(str(e), file=sys.stderr)
         return 1
     print(__doc__.strip(), file=sys.stderr)

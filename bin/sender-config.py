@@ -31,7 +31,15 @@ RECEIVER_KEYS = ("bitrate-mbps", "scale")
 
 
 class ConfigError(Exception):
-    pass
+    """A failure that isn't the caller's fault (unreadable or broken sender.toml); exit 1."""
+
+    code = 1
+
+
+class ArgError(ConfigError):
+    """A bad argument, key or value; exit 2 (see the helper's exit codes)."""
+
+    code = 2
 
 
 def config_path():
@@ -87,12 +95,12 @@ def literal(scope, key, text):
     """Turn a validated text value into a TOML literal of the right type."""
     allowed = TOP_KEYS if scope == "top" else RECEIVER_KEYS
     if key not in allowed:
-        raise ConfigError(f"{key} can't be set here")
+        raise ArgError(f"{key} can't be set here")
     if text == "":
         return None
     if key in ("max-fps", "bitrate-mbps"):
         if not re.fullmatch(r"[0-9]{1,3}", text):
-            raise ConfigError(f"{key} must be a whole number")
+            raise ArgError(f"{key} must be a whole number")
         value = int(text)
     elif key == "scale":
         if text in ("passthrough", "mac"):
@@ -102,15 +110,15 @@ def literal(scope, key, text):
             if value == int(value):
                 value = int(value)
         else:
-            raise ConfigError("scale must be passthrough, mac or a number")
+            raise ArgError("scale must be passthrough, mac or a number")
     elif key == "tailscale":
         if text not in ("true", "false"):
-            raise ConfigError("tailscale must be true or false")
+            raise ArgError("tailscale must be true or false")
         value = text == "true"
     else:
         value = text
     if not check_value(scope, key, value):
-        raise ConfigError(f"invalid value for {key}")
+        raise ArgError(f"invalid value for {key}")
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
@@ -230,7 +238,7 @@ def cmd_set(args):
         a = args[i]
         if a == "--receiver":
             if i + 1 >= len(args):
-                raise ConfigError("--receiver needs an id")
+                raise ArgError("--receiver needs an id")
             receiver = args[i + 1]
             i += 2
             continue
@@ -238,14 +246,14 @@ def cmd_set(args):
             i += 1
             continue
         if "=" not in a:
-            raise ConfigError(f"expected key=value, got {a!r}")
+            raise ArgError(f"expected key=value, got {a!r}")
         key, value = a.split("=", 1)
         changes.append((key.strip(), value.strip()))
         i += 1
     if receiver is not None and not ID_RE.match(receiver):
-        raise ConfigError("invalid receiver id")
+        raise ArgError("invalid receiver id")
     if not changes:
-        raise ConfigError("nothing to set")
+        raise ArgError("nothing to set")
     scope = "receiver" if receiver is not None else "top"
     lits = [(k, literal(scope, k, v)) for k, v in changes]
 
@@ -314,10 +322,10 @@ def main(argv):
             return cmd_set(argv[1:])
         if argv[0] == "rollback":
             return cmd_rollback()
-        raise ConfigError(f"unknown command {argv[0]!r}")
+        raise ArgError(f"unknown command {argv[0]!r}")
     except ConfigError as e:
         print(str(e), file=sys.stderr)
-        return 1
+        return e.code
 
 
 if __name__ == "__main__":

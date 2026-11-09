@@ -27,9 +27,27 @@ ID_RE='^[0-9A-Fa-f][0-9A-Fa-f-]{7,63}$'
 ADDR_RE='^[[A-Za-z0-9][]A-Za-z0-9.:[-]{0,79}:([0-9]{1,5})$'
 UNIT_RE='^(opendisplay-[0-9a-f]{8}|opendisplay-addr-[0-9a-f]{8}|od-sender@[A-Za-z0-9\\_.:-]{1,300})\.service$'
 
+# The transient units' Description is "<DESC_PREFIX><to>"; opendisplay-util.py
+# parses it back (DESC_PREFIX there). Keep the two in sync.
+DESC_PREFIX="OpenDisplay to "
+
 export NO_COLOR=1
 
-die() { printf '%s\n' "$*" >&2; exit 1; }
+# Exit codes (also listed in usage): 0 ok, 1 other failure, 2 invalid argument
+# or usage, 5 config saved but doctor unhappy, 6 config rejected and rolled
+# back, 7 template unit missing, 8 od-sender not installed, 9 external sender
+# running, 10 managed by pacman, 11 GitHub unreachable. The message is always
+# the last line of stderr.
+die_code() { local code="$1"; shift; printf '%s\n' "$*" >&2; exit "$code"; }
+die() { die_code 1 "$*"; }
+
+# Every bar watches this file to refresh after something changed. It is
+# written in place (never replaced) so file watchers keep working.
+stamp_change() {
+  mkdir -p "$STATE" 2>/dev/null
+  date +%s%N > "$STATE/changed" 2>/dev/null
+  return 0
+}
 
 valid_id() { [[ ${1-} =~ $ID_RE ]]; }
 
@@ -41,7 +59,7 @@ valid_addr() {
 
 valid_unit() { [[ ${1-} =~ $UNIT_RE ]]; }
 
-need_id() { valid_id "${1-}" || die "invalid receiver id"; }
+need_id() { valid_id "${1-}" || die_code 2 "invalid receiver id"; }
 
 # --- unit names: the only places these are built ----------------------------
 
@@ -81,7 +99,7 @@ find_sender() {
 }
 
 require_sender() {
-  SENDER="$(find_sender)" || die "od-sender is not installed"
+  SENDER="$(find_sender)" || die_code 8 "od-sender is not installed"
 }
 
 sender_version() {  # <path>
@@ -124,8 +142,9 @@ start_transient() {  # <unit> <to>
     active|activating) echo "already connected"; return 0 ;;
     failed) systemctl --user reset-failed -- "$unit" 2>/dev/null ;;
   esac
-  systemd-run --user --quiet --unit="$unit" --description="OpenDisplay to $to" \
-    --setenv=NO_COLOR=1 --property=Restart=no -- "$SENDER" run --to="$to" || return 1
+  systemd-run --user --quiet --unit="$unit" --description="$DESC_PREFIX$to" \
+    --setenv=NO_COLOR=1 --property=Restart=no -- "$SENDER" run --to="$to" \
+    || { echo "couldn't start $unit" >&2; return 1; }
   echo "$unit"
 }
 
@@ -139,7 +158,7 @@ cmd_connect() {
 }
 
 cmd_connect_addr() {
-  valid_addr "${1-}" || die "invalid address; use host:port"
+  valid_addr "${1-}" || die_code 2 "invalid address; use host:port"
   require_sender
   start_transient "$(addr_unit "$1")" "$1"
 }
@@ -188,12 +207,15 @@ cmd_disconnect() {
 cmd_restart() {
   local target="${1-}" u
   if valid_unit "$target"; then
-    systemctl --user restart -- "$target"
+    systemctl --user restart -- "$target" || die "couldn't restart $target"
     return
   fi
   need_id "$target"
   for u in "$(template_unit "$target")" "$(transient_unit "$target")"; do
-    if unit_active "$u"; then systemctl --user restart -- "$u"; return; fi
+    if unit_active "$u"; then
+      systemctl --user restart -- "$u" || die "couldn't restart $u"
+      return
+    fi
   done
   if lock_pid "$(output_for_id "$target")" >/dev/null; then
     cmd_disconnect "$target" && cmd_connect "$target"
@@ -207,11 +229,11 @@ cmd_autoconnect() {
   transient="$(transient_unit "$id")"
   case "$mode" in
     on)
-      "${PY[@]}" "$UTIL" status | grep -q '"templateInstalled": true' \
-        || die "Auto-connect needs the od-sender systemd unit"
+      "${PY[@]}" "$UTIL" template-installed \
+        || die_code 7 "Auto-connect needs the od-sender systemd unit"
       # Two senders for one receiver would fight; the template takes over.
       unit_active "$transient" && stop_units "$transient"
-      systemctl --user enable --now -- "$tpl"
+      systemctl --user enable --now -- "$tpl" || die "couldn't enable auto-connect"
       ;;
     off)
       local was_active=0
@@ -219,15 +241,15 @@ cmd_autoconnect() {
       systemctl --user disable --now -- "$tpl" 2>/dev/null
       [[ $(unit_state "$tpl") == failed ]] && systemctl --user reset-failed -- "$tpl" 2>/dev/null
       # Turning auto-connect off shouldn't drop a display that's in use.
-      if (( was_active )) && [[ ${3-} != --no-reconnect ]]; then cmd_connect "$id"; fi
+      if (( was_active )); then cmd_connect "$id"; fi
       return 0
       ;;
-    *) die "usage: autoconnect <id> on|off" ;;
+    *) die_code 2 "usage: autoconnect <id> on|off" ;;
   esac
 }
 
 cmd_logs() {
-  valid_unit "${1-}" || die "invalid unit"
+  valid_unit "${1-}" || die_code 2 "invalid unit"
   local since
   since="$(systemctl --user show -p InactiveExitTimestamp --timestamp=unix --value -- "$1" 2>/dev/null)"
   if [[ $since =~ ^@[0-9]+$ ]]; then
@@ -245,7 +267,7 @@ cmd_list() {
 # The last ERROR line of a unit's most recent run, for a connect that failed
 # before the log tail saw it.
 cmd_last_error() {
-  valid_unit "${1-}" || die "invalid unit"
+  valid_unit "${1-}" || die_code 2 "invalid unit"
   local since args=(--user -u "$1" -o cat -n 200 --no-pager)
   since="$(systemctl --user show -p InactiveExitTimestamp --timestamp=unix --value -- "$1" 2>/dev/null)"
   [[ $since =~ ^@[0-9]+$ ]] && args+=(--since="$since")
@@ -255,7 +277,7 @@ cmd_last_error() {
 # The connected/hello/Extending lines of a unit's current run, so a session
 # that started long ago still has its receiver's name and address.
 cmd_first_lines() {
-  valid_unit "${1-}" || die "invalid unit"
+  valid_unit "${1-}" || die_code 2 "invalid unit"
   local since
   since="$(systemctl --user show -p InactiveExitTimestamp --timestamp=unix --value -- "$1" 2>/dev/null)"
   [[ $since =~ ^@[0-9]+$ ]] || return 0
@@ -289,22 +311,30 @@ arch_name() {
   esac
 }
 
-fetch_release() {  # prints the path of a release JSON file
+# Prints the path of a release JSON file. Without <force>, a copy younger than
+# 6 hours is reused with no network, so every bar on every monitor shares one
+# check; with it, GitHub is always asked (with the ETag).
+fetch_release() {  # <force: 0|1>
   mkdir -p "$CACHE"
   if [[ -n ${OMARCHY_OPENDISPLAY_RELEASE_FILE-} ]]; then  # tests / manual acceptance
     printf '%s' "$OMARCHY_OPENDISPLAY_RELEASE_FILE"
     return 0
   fi
   local cached="$CACHE/release.json" etag="$CACHE/release.etag" tmp code
+  if [[ $1 != 1 && -s $cached ]] && (( $(date +%s) - $(stat -c %Y "$cached") < 21600 )); then
+    printf '%s' "$cached"
+    return 0
+  fi
   tmp="$(mktemp "$CACHE/release.XXXXXX")"
   local args=("${CURL[@]}" --max-filesize 1M -H 'Accept: application/vnd.github+json' -o "$tmp" -w '%{http_code}' --etag-save "$etag.new")
   [[ -s $cached && -s $etag ]] && args+=(--etag-compare "$etag")
   if ! code="$("${args[@]}" "$RELEASE_API")"; then
     rm -f "$tmp" "$etag.new"
-    die "Couldn't reach GitHub"
+    die_code 11 "Couldn't reach GitHub"
   fi
   if [[ $code == 304 ]]; then
     rm -f "$tmp" "$etag.new"
+    touch -c -- "$cached"  # unchanged, but checked just now
   else
     mv -f "$tmp" "$cached"
     if [[ -s $etag.new ]]; then mv -f "$etag.new" "$etag"; else rm -f "$etag.new"; fi
@@ -313,10 +343,14 @@ fetch_release() {  # prints the path of a release JSON file
 }
 
 cmd_check_update() {
-  local arch file installed=""
+  local force=0 arch file installed="" path
+  case "${1-}" in
+    "") ;;
+    --force) force=1 ;;
+    *) die_code 2 "usage: check-update [--force]" ;;
+  esac
   arch="$(arch_name)" || die "unsupported architecture: $(uname -m)"
-  file="$(fetch_release)" || exit 1
-  local path
+  file="$(fetch_release "$force")" || exit $?
   path="$(find_sender)" && installed="$(sender_version "$path")"
   "${PY[@]}" "$UTIL" release "$file" "$arch" "${installed:-none}"
 }
@@ -329,9 +363,45 @@ download() {  # <url> <dest>
   "${CURL[@]}" --max-filesize 50M -o "$2" "$1"
 }
 
+# Sessions stopped for an install, restarted afterwards (or when it fails).
+PLAN=""
+UNITS_STOPPED=0
+UNITS_RESTORED=0
+RESTORE_FAILED=0
+INSTALL_TMP=""
+
+restore_units() {
+  (( UNITS_RESTORED )) && return 0
+  UNITS_RESTORED=1
+  local kind unit to
+  SENDER="$(find_sender)" || SENDER=""
+  while read -r kind unit to; do
+    [[ -n ${unit-} ]] || continue
+    case "$kind" in
+      template) valid_unit "$unit" && systemctl --user start -- "$unit" ;;
+      id) valid_id "$to" && start_transient "$(transient_unit "$to")" "$to" >/dev/null ;;
+      addr) valid_addr "$to" && start_transient "$(addr_unit "$to")" "$to" >/dev/null ;;
+      *) false ;;
+    esac || { echo "couldn't restart $unit" >&2; RESTORE_FAILED=1; }
+  done <<< "$PLAN"
+  return 0
+}
+
+install_exit() {
+  local rc=$?
+  trap - EXIT
+  (( UNITS_STOPPED )) && restore_units
+  [[ -n $INSTALL_TMP ]] && rm -rf -- "$INSTALL_TMP"
+  stamp_change
+  exit "$rc"
+}
+
 cmd_install() {
+  trap install_exit EXIT
   (( EUID != 0 )) || die "Run as your user, not root"
-  mkdir -p "$CACHE"
+  mkdir -p "$CACHE" "$STATE"
+  exec 7> "$STATE/install.lock"
+  flock -n 7 || die "an install is already running"
   local log="$CACHE/last-update.log"
   # Everything below is also kept for the "Details" view.
   exec > >(tee "$log") 2>&1
@@ -339,12 +409,12 @@ cmd_install() {
   local vinfo
   vinfo="$(cmd_version)"
   if [[ $(json_field "$vinfo" managed) == package ]]; then
-    die "od-sender is installed by pacman; update it with your package manager"
+    die_code 10 "od-sender is installed by pacman; update it with your package manager"
   fi
 
   local arch info url digest sha_url latest
   arch="$(arch_name)" || die "unsupported architecture: $(uname -m)"
-  info="$(cmd_check_update)" || exit 1
+  info="$(cmd_check_update --force)" || exit $?
   url="$(json_field "$info" url)"
   digest="$(json_field "$info" digest)"
   sha_url="$(json_field "$info" sha256Url)"
@@ -354,7 +424,6 @@ cmd_install() {
 
   local top="od-sender-$arch-unknown-linux-gnu"
   INSTALL_TMP="$(mktemp -d "$CACHE/install.XXXXXX")"
-  trap 'rm -rf -- "$INSTALL_TMP"' EXIT
   local tmp="$INSTALL_TMP"
   echo "Downloading od-sender $latest"
   download "$url" "$tmp/od-sender.tar.gz" || die "download failed"
@@ -369,43 +438,28 @@ cmd_install() {
   # Stop what's running, remembering it so it comes back afterwards.
   local status
   status="$("${PY[@]}" "$UTIL" status)"
-  local plan
-  plan="$("${PY[@]}" -c '
-import json, sys
-s = json.loads(sys.argv[1])
-if any(x.get("unit") is None for x in s["sessions"]):
-    print("EXTERNAL"); sys.exit()
-for u in s["units"]:
-    if u["state"] not in ("active", "activating"):
-        continue
-    kind = "template" if u["template"] else ("addr" if u["unit"].startswith("opendisplay-addr-") else "id")
-    print(kind, u["unit"], u["to"])
-' "$status")"
-  if [[ $plan == EXTERNAL* ]]; then
-    die "Stop the od-sender running in your terminal first"
+  PLAN="$("${PY[@]}" "$UTIL" install-plan <<< "$status")" || die "couldn't work out what is running"
+  if [[ $PLAN == EXTERNAL* ]]; then
+    PLAN=""
+    die_code 9 "Stop the od-sender running in your terminal first"
   fi
   local kind unit to
+  UNITS_STOPPED=1  # from here on, any exit restarts the sessions
   while read -r kind unit to; do
     [[ -n ${unit-} ]] && valid_unit "$unit" && stop_units "$unit"
-  done <<< "$plan"
+  done <<< "$PLAN"
 
   echo "Running the official install.sh"
   ( cd "$tmp/x/$top" && bash ./install.sh ) || die "install.sh failed"
 
   SENDER="$(find_sender)" || die "od-sender isn't on PATH after installing"
-  while read -r kind unit to; do
-    [[ -n ${unit-} ]] || continue
-    case "$kind" in
-      template) valid_unit "$unit" && systemctl --user start -- "$unit" ;;
-      id) valid_id "$to" && start_transient "$(transient_unit "$to")" "$to" ;;
-      addr) valid_addr "$to" && start_transient "$(addr_unit "$to")" "$to" ;;
-    esac
-  done <<< "$plan"
+  restore_units
 
   local now
   now="$(sender_version "$SENDER")" || die "od-sender doesn't run after installing"
   [[ $now == "$latest" ]] || die "expected od-sender $latest, found $now"
   echo "Installed od-sender $now"
+  (( RESTORE_FAILED == 0 )) || die "od-sender was installed, but some sessions didn't restart"
 }
 
 # --- sender.toml ------------------------------------------------------------
@@ -423,15 +477,16 @@ cmd_config_set() {
   flock -w 15 9 || die "sender.toml is busy"
   local before after
   before="$(doctor_code)"
-  "${PY[@]}" "$CONFIG_TOOL" set "$@" || exit 1
+  local rc=0
+  "${PY[@]}" "$CONFIG_TOOL" set "$@" || rc=$?
+  (( rc == 0 )) || exit "$rc"  # 2 for a bad key or value, 1 otherwise
   after="$(doctor_code)"
   if [[ $before == 0 && $after == 2 ]]; then
     "${PY[@]}" "$CONFIG_TOOL" rollback
-    die "od-sender rejected the setting"
+    die_code 6 "od-sender rejected the setting"
   fi
   if [[ $after != 0 ]]; then
-    echo "od-sender can't run here" >&2
-    exit 5  # saved, but doctor isn't happy
+    die_code 5 "Saved, but od-sender doctor isn't happy"
   fi
 }
 
@@ -442,7 +497,7 @@ cmd_config_set() {
 # The body is already markup-escaped by the caller and passed as one argument.
 cmd_notify() {
   local key="${1-}" body="${2-}"
-  [[ $key =~ ^[A-Za-z0-9._:@-]{1,200}$ ]] || die "invalid notification key"
+  [[ $key =~ ^[A-Za-z0-9._:@-]{1,200}$ ]] || die_code 2 "invalid notification key"
   mkdir -p "$STATE"
   exec 8> "$STATE/notify.lock"
   flock -w 5 8 || return 0
@@ -481,11 +536,39 @@ cmd_details_run() {
 usage() {
   cat <<'EOF'
 usage: omarchy-opendisplay <command> [args]
-  connect <id> | connect-addr <host:port> | disconnect <id|unit> | restart <id|unit>
-  autoconnect <id> on|off | status --json | logs <unit> | last-error <unit> | list
-  version | check-update | install | update
-  config-get | config-set [--receiver <id>] key=value...
-  doctor | details
+
+Commands
+  connect <id>                 connect a receiver
+  connect-addr <host:port>     connect by address
+  disconnect <id|unit>         stop a session
+  restart <id|unit>            restart a session
+  autoconnect <id> on|off      turn auto-connect on or off
+  status [--json]              sessions, units and auto-connect as JSON
+  logs <unit>                  follow a unit's log
+  list                         discover receivers
+  version                      installed od-sender, as JSON
+  check-update [--force]       latest release, as JSON (cached for 6 hours)
+  install | update             install or update od-sender
+  config-get                   sender.toml as JSON
+  config-set [--receiver <id>] key=value...
+  doctor                       run od-sender doctor in a terminal
+  details                      show the last install log in a terminal
+
+Internal (used by the widget and tests)
+  last-error <unit>  first-lines <unit>  notify <key> <body>
+  doctor-run  details-run  unit-names <id>  addr-unit <host:port>
+
+Exit codes
+  0   success
+  1   other failure (the last line of stderr says why)
+  2   invalid argument (id, address, unit, key or value) or bad usage
+  5   config-set saved, but od-sender doctor isn't happy afterwards
+  6   config-set rejected by od-sender; the change was rolled back
+  7   auto-connect needs the od-sender systemd unit, which isn't installed
+  8   od-sender is not installed
+  9   install/update refused: an od-sender started outside the plugin is running
+  10  install/update refused: od-sender is managed by pacman
+  11  couldn't reach GitHub
 EOF
 }
 
@@ -493,19 +576,26 @@ main() {
   local cmd="${1-}"
   shift || true
   case "$cmd" in
+    connect|connect-addr|disconnect|restart|autoconnect|config-set) trap stamp_change EXIT ;;
+  esac
+  case "$cmd" in
     connect) cmd_connect "$@" ;;
     connect-addr) cmd_connect_addr "$@" ;;
     disconnect) cmd_disconnect "$@" ;;
     restart) cmd_restart "$@" ;;
     autoconnect) cmd_autoconnect "$@" ;;
-    status) exec "${PY[@]}" "$UTIL" status ;;
+    status)
+      [[ $# -eq 0 || ( $# -eq 1 && $1 == --json ) ]] || die_code 2 "usage: status [--json]"
+      mkdir -p "$STATE"
+      [[ -e $STATE/changed ]] || date +%s%N > "$STATE/changed"
+      exec "${PY[@]}" "$UTIL" status ;;
     logs) cmd_logs "$@" ;;
     list) cmd_list ;;
     last-error) cmd_last_error "$@" ;;
     first-lines) cmd_first_lines "$@" ;;
     notify) cmd_notify "$@" ;;
     version) cmd_version ;;
-    check-update) cmd_check_update ;;
+    check-update) cmd_check_update "$@" ;;
     install|update) cmd_install ;;
     config-get) exec "${PY[@]}" "$CONFIG_TOOL" get --json ;;
     config-set) cmd_config_set "$@" ;;
@@ -514,9 +604,9 @@ main() {
     details) launch_terminal "$HERE/omarchy-opendisplay" details-run ;;
     details-run) cmd_details_run ;;
     unit-names) need_id "${1-}"; transient_unit "$1"; echo; template_unit "$1"; echo; output_for_id "$1"; echo ;;
-    addr-unit) valid_addr "${1-}" || die "invalid address"; addr_unit "$1"; echo ;;
+    addr-unit) valid_addr "${1-}" || die_code 2 "invalid address"; addr_unit "$1"; echo ;;
     -h|--help|help|"") usage ;;
-    *) usage >&2; exit 1 ;;
+    *) usage >&2; exit 2 ;;
   esac
 }
 
