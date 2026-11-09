@@ -31,7 +31,6 @@ Sessions run as systemd user units, so they survive shell restarts and plugin re
 In the bar's widget settings:
 
 - **Check GitHub daily for od-sender updates** (on by default)
-- **Show the connected receiver's name in the bar** (on by default)
 
 ### Keyboard and IPC
 

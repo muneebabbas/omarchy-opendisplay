@@ -3,7 +3,6 @@
   "meta.extendingCount": { "one": "Extending onto %1 display", "other": "Extending onto %1 displays" },
   "meta.connecting": "Connecting to %1…",
   "meta.notConnected": "Not connected",
-  "bar.count": { "one": "%1 display", "other": "%1 displays" },
   "bar.tooltipLive": "Extending onto %1 · %2 fps",
   "bar.tooltipLiveNoStats": "Extending onto %1",
   "bar.tooltipCount": { "one": "Extending onto %1 display", "other": "Extending onto %1 displays" },

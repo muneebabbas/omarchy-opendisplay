@@ -761,23 +761,6 @@ function resolveTarget(text, rows) {
 
 // ------------------------------------------------------------------ bar + errors
 
-function truncateName(name, max) {
-  var n = clampText(name, 256)
-  return n.length > max ? n.substring(0, max - 1) + "…" : n
-}
-
-// kind: "none" | "name" | "count"
-function barLabel(state) {
-  var s = state || {}
-  if (!s.showName) return { kind: "none", text: "", count: 0 }
-  var live = s.cards instanceof Array ? s.cards : []
-  var connecting = s.connectingNames instanceof Array ? s.connectingNames : []
-  if (live.length > 1) return { kind: "count", text: "", count: live.length }
-  if (live.length === 1) return { kind: "name", text: truncateName(live[0].name, 12), count: 1 }
-  if (connecting.length > 0) return { kind: "name", text: truncateName(connecting[0], 12), count: 0 }
-  return { kind: "none", text: "", count: 0 }
-}
-
 function connectErrorKind(exitCode) {
   if (exitCode === 3) return "notFound"
   if (exitCode === 2) return "badConfig"

@@ -26,7 +26,6 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  readonly property bool showNameInBar: setting("showNameInBar", true) !== false
   readonly property var knownReceivers: Model.sanitizeKnown(setting("knownReceivers", []))
 
   // --- derived display state
@@ -40,9 +39,6 @@ Panel {
   }
   readonly property bool pulsing: (connecting && !connected) || reconnecting
   readonly property bool showEmpty: od.installed && cards.length === 0 && others.length === 0
-  readonly property var barLabelInfo: Model.barLabel({ showName: showNameInBar, cards: cards, connectingNames: od.connectingNames })
-  readonly property string barLabel: barLabelInfo.kind === "name" ? barLabelInfo.text
-    : (barLabelInfo.kind === "count" ? strings.tn("bar.count", barLabelInfo.count).arg(Commons.I18n.formatNumber(barLabelInfo.count)) : "")
 
   readonly property string heroMeta: {
     if (!od.versionKnown) return ""
@@ -442,19 +438,11 @@ Panel {
 
   // ------------------------------------------------------------ bar button
 
-  TextMetrics {
-    id: barLabelMetrics
-    font.family: button.fontFamily
-    font.pixelSize: button.fontSize
-    text: root.barLabel
-  }
-
   BarIconButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    labelText: vertical ? "" : root.barLabel
-    slotSize: Style.bar.iconSlot + (labelText !== "" ? Math.ceil(barLabelMetrics.advanceWidth) + Style.space(10) : 0)
+    slotSize: Style.bar.iconSlot
     tooltipText: root.barTooltip
     iconComponent: Component {
       Item {

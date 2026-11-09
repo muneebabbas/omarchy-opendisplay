@@ -14,10 +14,9 @@
     "category": "Display",
     "allowMultiple": false,
     "defaultSection": "right",
-    "defaults": { "checkUpdates": true, "showNameInBar": true },
+    "defaults": { "checkUpdates": true },
     "schema": [
-      { "key": "checkUpdates", "type": "boolean", "label": "Check GitHub daily for od-sender updates", "defaultValue": true },
-      { "key": "showNameInBar", "type": "boolean", "label": "Show the connected receiver's name in the bar", "defaultValue": true }
+      { "key": "checkUpdates", "type": "boolean", "label": "Check GitHub daily for od-sender updates", "defaultValue": true }
     ]
   }
 }

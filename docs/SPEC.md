@@ -160,10 +160,9 @@ Reference implementations to read before starting (read-only, never edit):
     "category": "Display",
     "allowMultiple": false,
     "defaultSection": "right",
-    "defaults": { "checkUpdates": true, "showNameInBar": true },
+    "defaults": { "checkUpdates": true },
     "schema": [
-      { "key": "checkUpdates", "type": "boolean", "label": "Check GitHub daily for od-sender updates", "defaultValue": true },
-      { "key": "showNameInBar", "type": "boolean", "label": "Show the connected receiver's name in the bar", "defaultValue": true }
+      { "key": "checkUpdates", "type": "boolean", "label": "Check GitHub daily for od-sender updates", "defaultValue": true }
     ]
   }
 }
@@ -283,14 +282,15 @@ Follow `docs/design.png` exactly for layout and density. Widths: `contentWidth: 
 
 ### Bar button (`BarIconButton` + `OpenDisplayIcon`)
 
-| State | Icon | Label (if `showNameInBar`) |
-|---|---|---|
-| od-sender not installed | dim tablet | none |
-| Idle | dim tablet | none |
-| Connecting / reconnecting | tablet with pulsing opacity (0.45↔1, `Style.duration(420)`, as tailscale's account row) | name |
-| Connected (1) | full-color tablet | receiver name (truncate at 12 chars) |
-| Connected (2+) | full-color tablet | "2 displays" (plural via `tn`) |
-| Update available | small badge dot in `Commons.Color.urgent` on the icon | unchanged |
+The bar never shows text next to the icon; state is carried by the icon alone, and the tooltip names the receiver(s).
+
+| State | Icon |
+|---|---|
+| od-sender not installed | dim tablet |
+| Idle | dim tablet |
+| Connecting / reconnecting | tablet with pulsing opacity (0.45↔1, `Style.duration(420)`, as tailscale's account row) |
+| Connected (1 or 2+) | full-color tablet |
+| Update available | small badge dot in `Commons.Color.urgent` on the icon (state unchanged) |
 
 Clicks: left toggles the panel; **right** disconnects all if anything is connected, otherwise connects the most recently used known receiver **by id** (never by name; it streams your desktop, so it must not jump to a different device that reuses a name) (no-op with a notification if none or not found); middle rescans and opens. Tooltip: the status line ("Extending onto iPad · 58 fps").
 
@@ -339,9 +339,8 @@ Use `PanelKeyCatcher` like tailscale: Up/Down move a cursor across the interacti
   - `presetForBitrate(n)`
   - `compareVersions(a, b)`
   - `relativeDays(ts, now)`
-  - `barLabel(state)`
   - `validateSetting(key, value)` (the same rules as §6, so the UI rejects input before calling the helper).
-- **`Panel.qml`** contains only the UI. Read the settings `checkUpdates` and `showNameInBar` via `root.setting(name, fallback)`; persist `knownReceivers` via `bar.shell.updateEntryInline`.
+- **`Panel.qml`** contains only the UI. Read the setting `checkUpdates` via `root.setting(name, fallback)`; persist `knownReceivers` via `bar.shell.updateEntryInline`.
 - **`ShellIpc`** target `io.github.muneebabbas.opendisplay` with `open/close/toggle/show/hide`, `status(): string`, `connect(name): string` (by id, or by name only if exactly one receiver in the merged list has that name; otherwise return `"ambiguous: use the id"`), `disconnect(name): string`, `disconnectAll(): string`, `rescan(): string`. Users can then bind keys themselves: `omarchy-shell io.github.muneebabbas.opendisplay connect iPad`. Document this in the README.
 
 ---

@@ -590,15 +590,6 @@ test("mergeReceivers: auto-connect offline is paused unless a waiting session ex
 
 // ------------------------------------------------------------------ sinks
 
-test("bar label: name truncated at 12, count for 2+, markup kept as text", () => {
-  eq(M.barLabel({ showName: true, cards: [{ name: "iPad" }] }), { kind: "name", text: "iPad", count: 1 })
-  eq(M.barLabel({ showName: true, cards: [{ name: "A very long tablet name" }] }).text, "A very long…")
-  eq(M.barLabel({ showName: true, cards: [{ name: "a" }, { name: "b" }] }), { kind: "count", text: "", count: 2 })
-  eq(M.barLabel({ showName: false, cards: [{ name: "iPad" }] }).kind, "none")
-  eq(M.barLabel({ showName: true, cards: [], connectingNames: ["iPad"] }).text, "iPad")
-  eq(M.barLabel({ showName: true, cards: [{ name: "<b>x</b>" }] }).text, "<b>x</b>")
-})
-
 test("notification bodies escape markup; everything else stays raw", () => {
   eq(M.escapeMarkup(MARKUP + " & more"), "&lt;img src=https://example.invalid/x&gt; &amp; more")
   eq(M.clampText(MARKUP, 64), MARKUP)
