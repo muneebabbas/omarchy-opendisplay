@@ -6,6 +6,8 @@
   verify-sha FILE SHAFILE DIGEST           check a download against .sha256 and the API digest
   check-tar FILE TOPDIR                    reject unsafe or unexpected tarball entries
   install-plan                             status JSON on stdin -> EXTERNAL or "<kind> <unit> <to>" lines
+  wifi-units                               status JSON on stdin -> running Wi-Fi session units, one per line
+  autoconnect-ids                          receiver ids with auto-connect enabled, one per line
   template-installed                       exit 0 if od-sender's systemd template unit exists, else 1
 """
 
@@ -14,13 +16,16 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import tarfile
 
 ID_RE = re.compile(r"^[0-9A-Fa-f][0-9A-Fa-f-]{7,63}$")
 OUTPUT_RE = re.compile(r"^od-[0-9a-f]{6}$")
-TRANSIENT_RE = re.compile(r"^opendisplay-(addr-)?[0-9a-f]{8}\.service$")
+TRANSIENT_RE = re.compile(r"^opendisplay-(addr-|usb-)?[0-9a-f]{8}\.service$")
+USB_UNIT_PREFIX = "opendisplay-usb-"
 TEMPLATE_RE = re.compile(r"^od-sender@(.+)\.service$")
 VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 MAX_JSON = 1024 * 1024
@@ -39,6 +44,32 @@ def runtime_dir():
 
 def config_home():
     return os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+
+
+def wifi_enabled():
+    """Wi-Fi connections are off while this flag file exists (bin/omarchy-opendisplay WIFI_OFF)."""
+    return not os.path.exists(os.path.join(config_home(), "omarchy-opendisplay", "wifi-disabled"))
+
+
+def usbmuxd_state():
+    """running | installed | missing. Keep in sync with bin/usbmux.py."""
+    env = os.environ.get("USBMUXD_SOCKET_ADDRESS", "")
+    fam, addr = socket.AF_UNIX, "/var/run/usbmuxd"
+    if env.startswith("UNIX:"):
+        addr = env[5:]
+    elif env and env.rpartition(":")[2].isdigit():
+        fam, addr = socket.AF_INET, (env.rpartition(":")[0], int(env.rpartition(":")[2]))
+    try:
+        with socket.socket(fam, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            s.connect(addr)
+            return "running"
+    except OSError:
+        pass
+    for d in ("/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin", "/bin", "/sbin"):
+        if os.path.isfile(os.path.join(d, "usbmuxd")):
+            return "installed"
+    return "installed" if shutil.which("usbmuxd") else "missing"
 
 
 def systemctl(*args):
@@ -165,13 +196,35 @@ def template_installed():
 
 
 def cmd_status():
+    sess, unit_list = sessions(), units()
+    # A USB session's sender runs with --to=127.0.0.1:<port>; its unit's
+    # Description carries the receiver id.
+    ids = {u["unit"]: u["id"] for u in unit_list if u["id"]}
+    for s in sess:
+        if s["id"] is None and s["unit"] in ids:
+            s["id"] = ids[s["unit"]]
+        s["transport"] = transport_for(s["unit"], s["to"])
+    for u in unit_list:
+        u["transport"] = transport_for(u["unit"], u["to"])
     print(json.dumps({
-        "sessions": sessions(),
-        "units": units(),
+        "sessions": sess,
+        "units": unit_list,
         "autoconnect": autoconnect(),
         "templateInstalled": template_installed(),
+        "wifi": wifi_enabled(),
+        "usb": usbmuxd_state(),
     }))
     return 0
+
+
+def transport_for(unit, to):
+    """usb for the plugin's USB units only; tailscale for a 100.64.0.0/10 address; else wifi."""
+    if (unit or "").startswith(USB_UNIT_PREFIX):
+        return "usb"
+    m = re.match(r"^100\.(\d+)\.\d+\.\d+:\d+$", to or "")
+    if m and 64 <= int(m.group(1)) <= 127:
+        return "tailscale"
+    return "wifi"
 
 
 def cmd_install_plan(text):
@@ -187,9 +240,20 @@ def cmd_install_plan(text):
             kind = "template"
         elif u["unit"].startswith("opendisplay-addr-"):
             kind = "addr"
+        elif u["unit"].startswith(USB_UNIT_PREFIX):
+            kind = "usb"
         else:
             kind = "id"
         print(kind, u["unit"], u["to"])
+    return 0
+
+
+def cmd_wifi_units(text):
+    """Running sessions that go over the network: everything but USB units."""
+    status = json.loads(text)
+    for u in status["units"]:
+        if u["state"] in ("active", "activating") and not u["unit"].startswith(USB_UNIT_PREFIX):
+            print(u["unit"])
     return 0
 
 
@@ -316,6 +380,11 @@ def main(argv):
             return cmd_status()
         if argv == ["install-plan"]:
             return cmd_install_plan(sys.stdin.read(MAX_JSON))
+        if argv == ["wifi-units"]:
+            return cmd_wifi_units(sys.stdin.read(MAX_JSON))
+        if argv == ["autoconnect-ids"]:
+            print("\n".join(autoconnect()))
+            return 0
         if argv == ["template-installed"]:
             return 0 if template_installed() else 1
         if argv[:1] == ["release"] and len(argv) == 4:

@@ -26,12 +26,34 @@ Display position, scale and rotation are handled by Omarchy's monitor panel, whi
 
 Sessions run as systemd user units, so they survive shell restarts and plugin reloads.
 
+Each connected receiver's card shows how it's connected (**USB**, **Wi-Fi** or **Tailscale**), and so do the panel heading and the bar tooltip ("Extending onto iPad over USB · 60 fps").
+
+### USB
+
+An iPad or iPhone plugged in by cable can be used over USB instead of Wi-Fi. od-sender has no USB transport on Linux, so the plugin adds one: `bin/usbmux.py` asks [usbmuxd](https://github.com/libimobiledevice/usbmuxd) for a tunnel to the OpenDisplay app's port (TCP 9000) on the device and forwards a loopback port to it, and od-sender connects to that port (`od-sender run --to=127.0.0.1:<port>`). The receiver reports the session as USB.
+
+- **Needs usbmuxd:** `sudo pacman -S usbmuxd`. It starts by itself when an Apple device is plugged in. Without usbmuxd, the panel shows a short hint when Wi-Fi connections are off or no receivers are found, and Doctor reports it.
+- A receiver that's plugged in shows a small **USB** tag in its row, and **Connect** (and right-click "connect last") use USB for it.
+- Unplugging the device ends the session.
+- Auto-connect stays Wi-Fi only: there's no USB auto-connect yet. Connecting a receiver by USB stops its waiting auto-connect sender for now (it stays enabled and starts again at the next login), so the two don't fight over the receiver.
+- Android receivers aren't supported over USB (they don't use usbmuxd).
+
+### Wi-Fi connections
+
+**Advanced → All receivers → Wi-Fi connections** (on by default) is a global switch. Turned off:
+
+- nothing scans the network (`od-sender list` isn't run at all), Connect by IP is hidden and Tailscale fallback doesn't apply;
+- running Wi-Fi sessions are disconnected; USB sessions keep running;
+- the helper refuses Wi-Fi connects (`connect`, `connect-addr`), whoever asks;
+- auto-connect units stay enabled but are skipped: a systemd drop-in for `od-sender@.service` adds an `ExecCondition` that checks the switch. Turning Wi-Fi back on removes the drop-in and starts them again.
+
+With Wi-Fi off and nothing plugged in, the panel offers **Turn on Wi-Fi**.
+
 ### Settings
 
 In the bar's widget settings:
 
 - **Check GitHub daily for od-sender updates** (on by default)
-- **Show the connected receiver's name in the bar** (on by default)
 
 ### Keyboard and IPC
 
@@ -46,6 +68,7 @@ omarchy-shell io.github.muneebabbas.opendisplay disconnect iPad
 omarchy-shell io.github.muneebabbas.opendisplay disconnectAll
 omarchy-shell io.github.muneebabbas.opendisplay rescan
 omarchy-shell io.github.muneebabbas.opendisplay status
+omarchy-shell io.github.muneebabbas.opendisplay wifi off             # on | off | status
 ```
 
 `connect <name>` only connects by name when exactly one receiver has that name; otherwise it answers `ambiguous: use the id`.
@@ -57,8 +80,11 @@ omarchy-shell io.github.muneebabbas.opendisplay status
 | Command | When |
 |---|---|
 | `od-sender --version`, `od-sender list --json --timeout 3`, `od-sender doctor` | Version check; discovery when the panel is open (on open, Rescan, and every 20 s); validating config changes |
-| `systemd-run --user --unit=opendisplay-<id8> … od-sender run --to=<id>` | Connect |
-| `systemctl --user stop/restart/enable/disable/show/list-units/reset-failed` on `opendisplay-*` and `od-sender@*` units | Disconnect, apply settings, auto-connect, status (every 5 s while connected, every 30 s otherwise) |
+| `systemd-run --user --unit=opendisplay-<id8> … od-sender run --to=<id>` | Connect over Wi-Fi (`opendisplay-addr-<sha1-8>` for Connect by IP) |
+| `systemd-run --user --unit=opendisplay-usb-<id8> … python3 -I bin/usbmux.py run --udid=<udid> --sender=<od-sender>`, which runs `od-sender run --to=127.0.0.1:<port>` | Connect over USB |
+| `python3 -I bin/usbmux.py list` (talks to usbmuxd's socket, `/var/run/usbmuxd`) | Finding receivers plugged in by USB, along with discovery |
+| `systemctl --user daemon-reload`, `systemctl --user start od-sender@*` | Turning Wi-Fi connections off or on (installing or removing the drop-in) |
+| `systemctl --user stop/restart/enable/disable/show/list-units/reset-failed` on `opendisplay-*`, `opendisplay-usb-*` and `od-sender@*` units | Disconnect, apply settings, auto-connect, status (every 5 s while connected, every 30 s otherwise) |
 | `journalctl --user -u <unit> -o cat -f` | Live stats while a session runs |
 | `kill -INT` / `kill -TERM` on an `od-sender` PID from its lock file | Disconnecting a sender you started outside the panel |
 | `python3 -I bin/sender-config.py`, `python3 -I bin/opendisplay-util.py` | Reading and editing `sender.toml`; status, release and archive checks (stdlib only) |
@@ -67,12 +93,14 @@ omarchy-shell io.github.muneebabbas.opendisplay status
 
 No `sudo` or `pkexec`, ever.
 
+Over USB, `bin/usbmux.py` reads the receiver's first message (its hello: id, device name, protocol version) on a connection it then closes without sending anything, to learn which receiver is on which device. It does this once per plug-in.
+
 **Hosts it contacts.** Only `api.github.com`, `github.com` and `objects.githubusercontent.com`, over HTTPS (redirects must stay on HTTPS; 60 s timeout; release JSON capped at 1 MB and downloads at 50 MB):
 
 - Once a day (and when you open the panel, if the last check was over 6 hours ago) it asks `api.github.com` for the latest od-sender release, with an ETag so unchanged answers are cheap. The check is shared: every bar on every monitor reuses a cached answer younger than 6 hours, so GitHub is asked at most about once every 6 hours. Turn **Check GitHub daily for od-sender updates** off to stop this. With od-sender not installed, opening the panel also fetches the release so it can offer to install it.
 - When you click Install or Update it downloads the release tarball and its `.sha256` file from GitHub.
 
-**Files it writes.** `~/.config/opendisplay/sender.toml` (plus `sender.toml.bak`), od-sender's files via the official `install.sh` (`~/.local/bin/od-sender`, `~/.local/share/applications/od-sender.desktop`, `~/.config/systemd/user/od-sender@.service`), enabled auto-connect units under `~/.config/systemd/user/`, a cache in `~/.cache/omarchy-opendisplay/`, lock files in `$XDG_RUNTIME_DIR/omarchy-opendisplay/`, and a list of up to 16 recently used receivers (id, name, last address, time) in this widget's entry in `~/.config/omarchy/shell.json`.
+**Files it writes.** `~/.config/opendisplay/sender.toml` (plus `sender.toml.bak`), od-sender's files via the official `install.sh` (`~/.local/bin/od-sender`, `~/.local/share/applications/od-sender.desktop`, `~/.config/systemd/user/od-sender@.service`), enabled auto-connect units under `~/.config/systemd/user/`, while Wi-Fi connections are off the flag file `~/.config/omarchy-opendisplay/wifi-disabled` (the switch's only state; the helper and the drop-in read it) and the drop-in `~/.config/systemd/user/od-sender@.service.d/omarchy-opendisplay-wifi.conf`, a cache in `~/.cache/omarchy-opendisplay/`, lock files and the USB device cache (`usb-cache.json`, receiver id per plugged-in device) in `$XDG_RUNTIME_DIR/omarchy-opendisplay/`, and a list of up to 16 recently used receivers (id, name, last address, time) in this widget's entry in `~/.config/omarchy/shell.json`.
 
 ## Security notes
 
@@ -80,6 +108,7 @@ No `sudo` or `pkexec`, ever.
 - **OpenDisplay is plain TCP with no encryption or pairing.** Anyone on the network path can see the stream, and any receiver that answers can be connected to. Use it on networks you trust, or over Tailscale.
 - Receiver names, log lines and release data are treated as untrusted. They're length-limited and always shown as plain text.
 - Auto-connect is off by default and only turned on by you, per receiver. It's LAN-only: `od-sender run --wait` doesn't try Tailscale peers.
+- USB sessions stay on the cable: the forwarder listens on 127.0.0.1 only, on a port the kernel picks, and connects only to the plugged-in device whose receiver was asked for. It forwards only connections made by its own od-sender (the peer socket's inode, from `/proc/net/tcp`, must be one of od-sender's open files), so other local programs can't reach the device through it. (`bin/usbmux.py forward`, a debugging aid the plugin never runs, doesn't check.)
 
 ## Remove
 
@@ -87,7 +116,7 @@ No `sudo` or `pkexec`, ever.
 omarchy plugin remove io.github.muneebabbas.opendisplay
 ```
 
-The plugin never uninstalls od-sender. To remove od-sender too, disable any auto-connect units (`systemctl --user disable --now 'od-sender@*'`), then run the uninstaller from the release tarball (`./install.sh --uninstall`) or delete `~/.local/bin/od-sender`, `~/.local/share/applications/od-sender.desktop` and `~/.config/systemd/user/od-sender@.service`. Your settings stay in `~/.config/opendisplay/`.
+If you turned Wi-Fi connections off, turn them back on first (or delete `~/.config/omarchy-opendisplay/` and `~/.config/systemd/user/od-sender@.service.d/omarchy-opendisplay-wifi.conf`). The plugin never uninstalls od-sender. To remove od-sender too, disable any auto-connect units (`systemctl --user disable --now 'od-sender@*'`), then run the uninstaller from the release tarball (`./install.sh --uninstall`) or delete `~/.local/bin/od-sender`, `~/.local/share/applications/od-sender.desktop` and `~/.config/systemd/user/od-sender@.service`. Your settings stay in `~/.config/opendisplay/`.
 
 ## Development
 
@@ -96,6 +125,8 @@ There's no build step and nothing to install into the repo: the plugin is plain 
 ### Dependencies
 
 To run the plugin (all present on a stock Omarchy install): the Omarchy shell, bash 4+, python3 3.11+ (for `tomllib`), systemd user services (`systemctl`, `systemd-run`, `journalctl`, `systemd-escape`), coreutils, util-linux (`flock`), `tar`, `curl`, `notify-send` and `xdg-terminal-exec`.
+
+For USB connections, `usbmuxd` (optional).
 
 To run the tests, add Node.js 20+ and `jq`. The tests never touch your real session: `tests/helper.sh` runs the helper against a fake `od-sender`, fake `systemctl`/`systemd-run`/`notify-send`, a temporary `HOME` and no network.
 
@@ -130,7 +161,7 @@ CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull requ
 
 ### Helper exit codes
 
-The helper's exit codes are part of its contract with the widget (for example 2 for an invalid argument, 8 when od-sender isn't installed, 11 when GitHub can't be reached). Run `bin/omarchy-opendisplay help` for the full list.
+The helper's exit codes are part of its contract with the widget (for example 2 for an invalid argument, 8 when od-sender isn't installed, 11 when GitHub can't be reached, 12 when Wi-Fi connections are off, 13 when usbmuxd isn't available, 14 when a receiver isn't plugged in). Run `bin/omarchy-opendisplay help` for the full list.
 
 ### Trying changes in the shell
 
@@ -147,7 +178,7 @@ omarchy plugin enable io.github.muneebabbas.opendisplay   # first time only
 - Sessions run in systemd, so a connected display survives the restart.
 - Shell log: `journalctl --user -t omarchy-shell -f`.
 
-The helper also works on its own, which is handy for debugging: `bin/omarchy-opendisplay status`, `list`, `version`, `check-update`, `config-get` and so on (`bin/omarchy-opendisplay help`). For acceptance testing an update, `OMARCHY_OPENDISPLAY_RELEASE_FILE=<release.json>` points `check-update` and `install` at a local release object instead of GitHub.
+The helper also works on its own, which is handy for debugging: `bin/omarchy-opendisplay status`, `list`, `usb-list`, `wifi status`, `version`, `check-update`, `config-get` and so on (`bin/omarchy-opendisplay help`). For acceptance testing an update, `OMARCHY_OPENDISPLAY_RELEASE_FILE=<release.json>` points `check-update` and `install` at a local release object instead of GitHub.
 
 `docs/SPEC.md` is the design spec, including the manual acceptance tests.
 

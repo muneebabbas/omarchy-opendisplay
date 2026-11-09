@@ -26,7 +26,6 @@ Panel {
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
-  readonly property bool showNameInBar: setting("showNameInBar", true) !== false
   readonly property var knownReceivers: Model.sanitizeKnown(setting("knownReceivers", []))
 
   // --- derived display state
@@ -40,15 +39,16 @@ Panel {
   }
   readonly property bool pulsing: (connecting && !connected) || reconnecting
   readonly property bool showEmpty: od.installed && cards.length === 0 && others.length === 0
-  readonly property var barLabelInfo: Model.barLabel({ showName: showNameInBar, cards: cards, connectingNames: od.connectingNames })
-  readonly property string barLabel: barLabelInfo.kind === "name" ? barLabelInfo.text
-    : (barLabelInfo.kind === "count" ? strings.tn("bar.count", barLabelInfo.count).arg(Commons.I18n.formatNumber(barLabelInfo.count)) : "")
+  // Only where USB is the way forward: Wi-Fi off, or nothing found.
+  readonly property bool showUsbHint: od.installed && od.usbState === "missing" && (!od.wifiEnabled || showEmpty)
+
+  function linkFor(card) { return Model.linkLabel(card.via, statsFor(card.key).transport) }
 
   readonly property string heroMeta: {
     if (!od.versionKnown) return ""
     if (!od.installed) return strings.t("meta.notConnected")
     if (cards.length > 1) return strings.tn("meta.extendingCount", cards.length).arg(Commons.I18n.formatNumber(cards.length))
-    if (cards.length === 1) return strings.t("meta.extending").arg(cards[0].name)
+    if (cards.length === 1) return strings.t("meta.extendingVia").arg(cards[0].name).arg(linkFor(cards[0]))
     if (connecting) return strings.t("meta.connecting").arg(od.connectingNames[0])
     return strings.t("meta.notConnected")
   }
@@ -59,8 +59,8 @@ Panel {
     if (cards.length === 1) {
       var c = cards[0]
       var fps = statsFor(c.key).fps
-      if (fps >= 0) return strings.t("bar.tooltipLive").arg(c.name).arg(Commons.I18n.formatNumber(Number(Model.formatRate(fps))))
-      return strings.t("bar.tooltipLiveNoStats").arg(c.name)
+      if (fps >= 0) return strings.t("bar.tooltipLive").arg(c.name).arg(linkFor(c)).arg(Commons.I18n.formatNumber(Number(Model.formatRate(fps))))
+      return strings.t("bar.tooltipLiveNoStats").arg(c.name).arg(linkFor(c))
     }
     if (connecting) return strings.t("bar.tooltipConnecting").arg(od.connectingNames[0])
     return strings.t("bar.tooltipIdle")
@@ -180,7 +180,8 @@ Panel {
       keys.push(navKey("fps"))
       keys.push(navKey("encoder"))
       keys.push(navKey("cursor"))
-      keys.push(navKey("tailscale"))
+      keys.push(navKey("wifi"))
+      if (od.wifiEnabled) keys.push(navKey("tailscale"))
     }
     keys.push(navKey("doctor", akey))
   }
@@ -208,7 +209,11 @@ Panel {
       keys.push(navKey("chev", o.key))
       if (isAdvOpen(advKey(o.id, o.key))) pushAdvancedKeys(keys, advKey(o.id, o.key))
     }
-    if (showEmpty) { keys.push("emptyRescan"); keys.push("emptyIp"); keys.push("emptyDoctor") }
+    if (showEmpty) {
+      keys.push("emptyRescan")
+      keys.push(od.wifiEnabled ? "emptyIp" : "emptyWifi")
+      keys.push("emptyDoctor")
+    }
     if (footerClickable) keys.push("footer")
     return keys
   }
@@ -278,6 +283,7 @@ Panel {
     else if (k === "install") requestInstall()
     else if (k === "release") od.openRelease()
     else if (k === "emptyIp") openIpEntry()
+    else if (k === "emptyWifi") { if (!od.busy) od.setWifi(true) }
     else if (k === "emptyDoctor") od.openDoctor()
     else if (k === "footer") footerAction()
     else if (p.kind === "disc") od.disconnect(od.targetFor(cardByKey(arg)))
@@ -296,6 +302,8 @@ Panel {
     } else if (p.kind === "auto") {
       var r3 = receiverByAkey(arg)
       if (r3 && !od.busy) od.setAutoConnect(r3.id, r3.autoConnect !== true)
+    } else if (k === "wifi") {
+      if (!od.busy) od.setWifi(!od.wifiEnabled)
     } else if (k === "tailscale") {
       if (!od.busy) od.setGlobalOption("tailscale", Model.globalValue(od.config, "tailscale", true) !== false ? "false" : "true")
     } else if (p.kind === "bitrate" || k === "fps") {
@@ -426,8 +434,8 @@ Panel {
       var r = Model.resolveTarget(name, rows)
       if (r.error === "ambiguous") return "ambiguous: use the id"
       if (r.error !== "") return "not found"
-      od.connect(r.id)
-      return "connecting"
+      // With Wi-Fi connections off only a receiver on USB can connect.
+      return od.connect(r.id) ? "connecting" : "not connected by USB"
     }
     function disconnect(name: string): string {
       var r = Model.resolveTarget(name, root.cards)
@@ -438,23 +446,20 @@ Panel {
     }
     function disconnectAll(): string { return "disconnecting " + od.disconnectAll() }
     function rescan(): string { root.open(); od.scan(); return "scanning" }
+    function wifi(state: string): string {
+      if (state === "on" || state === "off") { od.setWifi(state === "on"); return "wifi " + state }
+      if (state === "" || state === "status") return od.wifiEnabled ? "on" : "off"
+      return "usage: wifi on|off|status"
+    }
   }
 
   // ------------------------------------------------------------ bar button
-
-  TextMetrics {
-    id: barLabelMetrics
-    font.family: button.fontFamily
-    font.pixelSize: button.fontSize
-    text: root.barLabel
-  }
 
   BarIconButton {
     id: button
     anchors.fill: parent
     bar: root.bar
-    labelText: vertical ? "" : root.barLabel
-    slotSize: Style.bar.iconSlot + (labelText !== "" ? Math.ceil(barLabelMetrics.advanceWidth) + Style.space(10) : 0)
+    slotSize: Style.bar.iconSlot
     tooltipText: root.barTooltip
     iconComponent: Component {
       Item {
@@ -754,7 +759,7 @@ Panel {
             Text {
               textFormat: Text.PlainText
               width: parent.width
-              text: od.scanned ? strings.t("empty.text") : strings.t("empty.scanning")
+              text: !od.wifiEnabled ? strings.t("empty.usbOnly") : (od.scanned ? strings.t("empty.text") : strings.t("empty.scanning"))
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -778,7 +783,20 @@ Panel {
                 onClicked: od.scan()
               }
               Button {
+                property string navKey: "emptyWifi"
+                visible: !od.wifiEnabled
+                text: strings.t("empty.wifiOn")
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.bodySmall
+                hasCursor: root.hasCursor("emptyWifi")
+                onHovered: function(h) { if (h) root.setCursor("emptyWifi") }
+                onClicked: if (!od.busy) od.setWifi(true)
+              }
+              Button {
                 property string navKey: "emptyIp"
+                visible: od.wifiEnabled
                 text: strings.t("empty.connectByIp")
                 bordered: true
                 selected: root.ipEntryOpen
@@ -804,7 +822,7 @@ Panel {
 
             TextField {
               id: ipField
-              visible: root.ipEntryOpen
+              visible: root.ipEntryOpen && od.wifiEnabled
               width: parent.width
               foreground: root.foreground
               placeholderText: "192.168.1.20:9000"
@@ -824,6 +842,18 @@ Panel {
                 }
               }
             }
+          }
+
+          // --- USB hint (usbmuxd not installed)
+          Text {
+            textFormat: Text.PlainText
+            visible: root.showUsbHint
+            width: parent.width
+            text: strings.t("hint.usbmuxd")
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
 
           // --- footer
@@ -1009,8 +1039,7 @@ Panel {
               id: tag
               textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
-              visible: text !== ""
-              text: Model.transportLabel(root.statsFor(cardRoot.card.key).transport || "").toUpperCase()
+              text: root.linkFor(cardRoot.card).toUpperCase()
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1131,15 +1160,30 @@ Panel {
           spacing: Style.space(2)
           opacity: rowRoot.waiting ? 0.6 : 1.0
 
-          Text {
-            textFormat: Text.PlainText
+          RowLayout {
             Layout.fillWidth: true
-            text: rowRoot.row.name || ""
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            font.bold: true
-            elide: Text.ElideRight
+            spacing: Style.space(6)
+            Text {
+              textFormat: Text.PlainText
+              Layout.fillWidth: true
+              Layout.maximumWidth: implicitWidth
+              text: rowRoot.row.name || ""
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              font.bold: true
+              elide: Text.ElideRight
+            }
+            Text {
+              textFormat: Text.PlainText
+              visible: rowRoot.row.usb === true
+              text: "USB"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.letterSpacing: 1
+            }
+            Item { Layout.fillWidth: true }
           }
           Text {
             textFormat: Text.PlainText
@@ -1452,6 +1496,29 @@ Panel {
 
     SettingRow {
       visible: adv.showGlobals
+      label: strings.t("advanced.wifi")
+      ToggleSwitch {
+        id: wifiSwitch
+        property string navKey: root.navKey("wifi")
+        checked: od.wifiEnabled
+        busy: od.busy
+        cursorRing: true
+        cursorPad: Style.space(2)
+        hasCursor: root.hasCursor(navKey)
+        onHovered: function(h) { if (h) root.setCursor(navKey) }
+        foreground: root.foreground
+        onToggled: od.setWifi(!od.wifiEnabled)
+        PanelToolTip {
+          visible: wifiSwitch.containsMouse
+          text: strings.t("advanced.wifiHint")
+          fontFamily: root.fontFamily
+        }
+      }
+    }
+
+    SettingRow {
+      // Irrelevant with Wi-Fi connections off.
+      visible: adv.showGlobals && od.wifiEnabled
       label: strings.t("advanced.tailscale")
       ToggleSwitch {
         property string navKey: root.navKey("tailscale")

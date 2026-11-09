@@ -39,10 +39,16 @@ Item {
   property double lastUpdateCheckMs: 0
 
   // --- receivers and sessions
-  property bool scanning: false
+  readonly property bool scanning: scanProc.pending || usbProc.pending
   property bool scanned: false
   property var discovered: []
-  property var status: ({ ok: false, sessions: [], units: [], autoconnect: [], templateInstalled: false })
+  // Receivers plugged in by USB (usb-list), merged with `discovered` by id.
+  property var usbDevices: []
+  property var status: ({ ok: false, sessions: [], units: [], autoconnect: [], templateInstalled: false, wifi: true, usb: "missing" })
+  // Global "Wi-Fi connections" switch; the helper's flag file is the truth.
+  readonly property bool wifiEnabled: status.wifi !== false
+  // usbmuxd: "running" | "installed" | "missing"
+  readonly property string usbState: status.usb || "missing"
   property var config: ({})
   // `cards` and `others` are reassigned only when their structure changes, so
   // the panel's delegates survive a stats tick; live numbers are in `stats`.
@@ -165,10 +171,29 @@ Item {
     if (!configProc.pending) configProc.running = true
   }
 
+  // Discovery: USB always, the network only while Wi-Fi connections are on.
   function scan() {
-    if (!installed || scanProc.pending) return
-    scanning = true
-    scanProc.running = true
+    if (!installed) return
+    if (!usbProc.pending) usbProc.running = true
+    if (wifiEnabled && !scanProc.pending) scanProc.running = true
+  }
+
+  function setWifi(on) {
+    clearError()
+    if (!on) { discovered = []; rebuild() }
+    actions.enqueue(["wifi", on ? "on" : "off"], function(code, out, err) {
+      if (code !== 0) handleHelperError(code, out, err)
+      else {
+        // The helper has switched; reflect it now so scan() (which skips the
+        // network while wifiEnabled is false) doesn't wait for the status refresh.
+        var next = {}
+        for (var k in status) next[k] = status[k]
+        next.wifi = on
+        status = next
+        if (on) scan()
+      }
+      refreshStatus()
+    })
   }
 
   function checkUpdate(force) {
@@ -196,7 +221,7 @@ Item {
   function rebuild() {
     var now = Date.now()
     var sessions = Model.buildSessions(status, _live, _pending, discovered, knownReceivers, now)
-    var merged = Model.mergeReceivers(discovered, knownReceivers, sessions, status.autoconnect, now)
+    var merged = Model.mergeReceivers(discovered, knownReceivers, sessions, status.autoconnect, now, usbDevices)
 
     var connecting = []
     for (var m = 0; m < merged.others.length; m++) {
@@ -246,6 +271,8 @@ Item {
     _pending = r.pending
     _pendingUnits = r.pendingUnits
     for (var i = 0; i < r.failures.length; i++) reportConnectFailure(r.failures[i].unit, r.failures[i].status)
+    // Wi-Fi turned off (here or on another monitor): drop what the network showed.
+    if (!parsed.wifi && discovered.length > 0) discovered = []
     status = parsed
     syncTails()
     rebuild()
@@ -329,15 +356,18 @@ Item {
 
   // ------------------------------------------------------------ actions
 
+  // Over USB when the receiver is plugged in, else over Wi-Fi if allowed.
   function connect(id) {
     if (!Model.isValidId(id)) return false
+    var route = Model.connectRoute(id, usbDevices, wifiEnabled)
+    if (route === "") { setError("error.notOnUsb"); return false }
     clearError()
     var p = {}
     for (var k in _pending) p[k] = _pending[k]
-    p[id.toUpperCase()] = { id: id, since: Date.now() }
+    p[id.toUpperCase()] = { id: id, since: Date.now(), via: route }
     _pending = p
     rebuild()
-    actions.enqueue(["connect", id], function(code, out, err) {
+    actions.enqueue([route === "usb" ? "connect-usb" : "connect", id], function(code, out, err) {
       if (code !== 0) {
         forgetPending(id)
         handleHelperError(code, out, err)
@@ -349,6 +379,7 @@ Item {
   }
 
   function connectAddr(addr) {
+    if (!wifiEnabled) { setError("error.wifiOff"); return false }
     var a = String(addr || "").trim()
     if (!Model.isValidAddr(a)) { setError("error.invalidAddr"); return false }
     clearError()
@@ -413,8 +444,18 @@ Item {
     if (cards.length > 0 || connectingNames.length > 0) { disconnectAll(); return "disconnected" }
     var last = Model.lastUsedReceiver(knownReceivers)
     if (!last) return "none"
+    // With Wi-Fi off only USB is possible: look at what's plugged in now.
+    if (!wifiEnabled) {
+      lookups.enqueue(["usb-list"], function(code, out) {
+        var r = Model.parseUsbList(out)
+        if (r.ok) applyUsb(r.items)
+        if (Model.connectRoute(last.id, usbDevices, false) === "usb") connect(last.id)
+        else notify(t("error.recentNotOnUsb").arg(last.name), "missing:" + Date.now())
+      })
+      return "connecting"
+    }
     // By id only: it streams the desktop, so never jump to a lookalike name.
-    var online = false
+    var online = Model.onUsb(usbDevices, last.id)
     for (var i = 0; i < others.length; i++) {
       var o = others[i]
       if (Model.sameId(o.id, last.id) && o.state !== "waiting" && o.state !== "paused") online = true
@@ -422,6 +463,12 @@ Item {
     if (!online && scanned) return "missing"
     connect(last.id)
     return "connecting"
+  }
+
+  function applyUsb(items) {
+    if (JSON.stringify(items) === JSON.stringify(usbDevices)) return
+    usbDevices = items
+    rebuild()
   }
 
   function cardForId(id) {
@@ -538,7 +585,8 @@ Item {
     if (cards.length === 1) {
       var c = cards[0]
       var fps = (stats[c.key] || {}).fps
-      return "Extending onto " + c.name + (c.state === "reconnecting" ? " (reconnecting)" : (fps >= 0 ? " · " + Model.formatRate(fps) + " fps" : ""))
+      var link = Model.linkLabel(c.via, (stats[c.key] || {}).transport)
+      return "Extending onto " + c.name + " over " + link + (c.state === "reconnecting" ? " (reconnecting)" : (fps >= 0 ? " · " + Model.formatRate(fps) + " fps" : ""))
     }
     if (connectingNames.length > 0) return "Connecting to " + connectingNames[0]
     return "Not connected"
@@ -710,16 +758,27 @@ Item {
     id: scanProc
     command: [root.helperPath, "list"]
     onFinished: function(code, out) {
-      root.scanning = false
       var r = Model.parseList(out)
-      if (code === 0 && r.ok) {
-        var sig = JSON.stringify(r.items)
-        if (sig !== JSON.stringify(root.discovered)) root.discovered = r.items
-        root.scanned = true
-        root.rebuild()
-      } else if (root.installed) {
-        root.setError("error.scanFailed")
-      }
+      var ok = code === 0 && r.ok
+      var action = Model.scanErrorAction(ok, root.installed, root.errorKey)
+      if (action === "clear") root.clearError()
+      else if (action === "set") root.setError("error.scanFailed")
+      if (!ok) return
+      // Wi-Fi may have been turned off while this scan ran.
+      var items = root.wifiEnabled ? r.items : []
+      if (JSON.stringify(items) !== JSON.stringify(root.discovered)) root.discovered = items
+      root.scanned = true
+      root.rebuild()
+    }
+  }
+
+  Job {
+    id: usbProc
+    command: [root.helperPath, "usb-list"]
+    onFinished: function(code, out) {
+      var r = Model.parseUsbList(out)
+      if (code === 0 && r.ok) root.applyUsb(r.items)
+      if (!root.wifiEnabled) { root.scanned = true; root.rebuild() }
     }
   }
 
