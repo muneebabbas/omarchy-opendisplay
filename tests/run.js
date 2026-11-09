@@ -380,7 +380,7 @@ test("buildSessions: live, reconnecting, connecting, waiting, pending, external 
   eq(clone([status, live, pending, discovered, known]), snap)
 
   eq(r[0], { key: U1, id: ID, unit: U1, output: "od-a0ec23", pid: 1, to: "", external: false, template: false,
-    name: "iPad", state: "live", fps: 58, mbps: 1.4, latency: 17, transport: "WiFi" })
+    via: "wifi", name: "iPad", state: "live", fps: 58, mbps: 1.4, latency: 17, transport: "WiFi" })
   eq(r[1].state, "reconnecting")
   eq(r[1].template, true)
   eq([r[1].fps, r[1].transport], [-1, ""])
@@ -390,7 +390,7 @@ test("buildSessions: live, reconnecting, connecting, waiting, pending, external 
   eq([r[4].state, r[4].template, r[4].id], ["waiting", true, "DDDD0000-0000"])
   eq(r.length, 6)
   eq(r[5], { key: "pending:AAAA0000-0000", id: "aaaa0000-0000", unit: "", output: "", to: "", external: false,
-    template: false, name: "", state: "connecting", fps: -1, mbps: -1, latency: -1, transport: "" })
+    template: false, via: "wifi", name: "", state: "connecting", fps: -1, mbps: -1, latency: -1, transport: "" })
 })
 
 test("buildSessions: pending covered by a session (case-insensitive) is not added", () => {
@@ -647,6 +647,100 @@ test("connect exit codes", () => {
   eq(M.connectErrorKind(3), "notFound")
   eq(M.connectErrorKind(2), "badConfig")
   eq(M.connectErrorKind(1), "other")
+})
+
+// ------------------------------------------------------------------ USB + Wi-Fi toggle
+
+const UDID = "00008027-0014490A1AE8002E"
+
+test("usb unit names validate; parseUsbList bounds and validates", () => {
+  ok(M.isValidUnit("opendisplay-usb-a0ec2343.service"))
+  ok(!M.isValidUnit("opendisplay-usbx-a0ec2343.service"))
+  const r = M.parseUsbList(JSON.stringify([
+    { udid: UDID, deviceId: 1, id: ID, name: "iPad", pv: 3 },
+    { udid: UDID, deviceId: 1, id: ID.toLowerCase(), name: "dup" },
+    { udid: "-x", id: "BEEF0000-0000" },
+    { udid: UDID, id: "nope" },
+    { udid: UDID, id: "BEEF0000-0000", name: MARKUP + "\u0007" }
+  ]))
+  eq(r.ok, true)
+  eq(r.items, [{ id: ID, name: "iPad", udid: UDID }, { id: "BEEF0000-0000", name: MARKUP, udid: UDID }])
+  eq(M.parseUsbList("{}").ok, false)
+})
+
+test("connectRoute prefers USB, refuses Wi-Fi when it's off", () => {
+  const usb = [{ id: ID, name: "iPad", udid: UDID }]
+  eq(M.connectRoute(ID.toLowerCase(), usb, true), "usb")
+  eq(M.connectRoute(ID, usb, false), "usb")
+  eq(M.connectRoute("BEEF0000-0000", usb, true), "wifi")
+  eq(M.connectRoute("BEEF0000-0000", usb, false), "")
+  eq(M.connectRoute("nope", usb, true), "")
+})
+
+test("mergeReceivers: USB and network rows merge by id; USB-only rows are listed", () => {
+  const discovered = [{ id: ID, name: "iPad", addr: "10.0.0.2:9000", pv: 3 },
+    { id: "CAFE0000-0000", name: "Mac", addr: "10.0.0.3:9000", pv: 3 }]
+  const usb = [{ id: ID.toLowerCase(), name: "iPad", udid: UDID }, { id: "BEEF0000-0000", name: "iPhone", udid: UDID }]
+  const r = M.mergeReceivers(discovered, [], [], [], 0, usb)
+  eq(r.others.map(o => [o.id, o.usb, o.addr]), [[ID, true, "10.0.0.2:9000"], ["CAFE0000-0000", false, "10.0.0.3:9000"], ["BEEF0000-0000", true, ""]])
+  // Wi-Fi off: only USB
+  eq(M.mergeReceivers([], [], [], [], 0, usb).others.map(o => o.id), [ID.toLowerCase(), "BEEF0000-0000"])
+  // a live USB session is a card, not also a row
+  const sessions = M.buildSessions(mkStatus({
+    sessions: [mkSession({ unit: "opendisplay-usb-a0ec2343.service", id: ID, to: "127.0.0.1:4000", via: "usb" })]
+  }), {}, {}, [], [], 0)
+  const live = M.mergeReceivers([], [], sessions, [], 0, usb)
+  eq(live.cards.map(c => [c.id, c.via]), [[ID, "usb"]])
+  eq(live.others.map(o => o.id), ["BEEF0000-0000"])
+  ok(M.othersSignature(r.others) !== M.othersSignature(M.mergeReceivers(discovered, [], [], [], 0, [])))
+})
+
+test("parseStatus reads wifi, usbmuxd state and each session's link", () => {
+  const st = M.parseStatus(JSON.stringify({
+    wifi: false, usb: "running",
+    sessions: [{ output: "od-a0ec23", unit: "opendisplay-usb-a0ec2343.service", id: ID, transport: "usb" }],
+    units: [{ unit: "opendisplay-usb-a0ec2343.service", state: "active", id: ID, transport: "usb" },
+      { unit: "opendisplay-addr-0123abcd.service", state: "active", transport: "<b>" }]
+  }))
+  eq([st.wifi, st.usb], [false, "running"])
+  eq(st.sessions[0].via, "usb")
+  eq(st.units.map(u => u.via), ["usb", "wifi"])
+  const d = M.parseStatus("{}")
+  eq([d.wifi, d.usb], [true, "missing"])
+  eq(M.parseStatus(JSON.stringify({ usb: "maybe" })).usb, "missing")
+})
+
+test("linkLabel: USB and Tailscale from the session, else the receiver's report, else Wi-Fi", () => {
+  eq(M.linkLabel("usb", "WiFi"), "USB")
+  eq(M.linkLabel("tailscale", "WiFi"), "Tailscale")
+  eq(M.linkLabel("wifi", "WiFi"), "Wi-Fi")
+  eq(M.linkLabel("wifi", "USB"), "USB")
+  eq(M.linkLabel("wifi", ""), "Wi-Fi")
+  eq(M.linkLabel(undefined, undefined), "Wi-Fi")
+})
+
+test("scanErrorAction: success clears only the scan error", () => {
+  eq(M.scanErrorAction(true, true, "error.scanFailed"), "clear")
+  eq(M.scanErrorAction(true, true, "error.notFound"), "keep")
+  eq(M.scanErrorAction(true, true, ""), "keep")
+  eq(M.scanErrorAction(false, true, ""), "set")
+  eq(M.scanErrorAction(false, false, ""), "keep")
+})
+
+test("a USB session's loopback address isn't remembered", () => {
+  const e = M.reduceLive({ id: ID, name: "iPad", addr: "127.0.0.1:41234" },
+    { kind: "extending", ts: 5, name: "iPad", id: ID }, 10, {})
+  eq(e.effects.used.addr, "")
+  const w = M.reduceLive({ id: ID, addr: "10.0.0.2:9000" }, { kind: "extending", ts: 5, name: "iPad", id: ID }, 10, {})
+  eq(w.effects.used.addr, "10.0.0.2:9000")
+  ok(M.isLoopbackAddr("[::1]:9000"))
+  ok(!M.isLoopbackAddr("10.0.0.1:9000"))
+})
+
+test("helperError maps the USB and Wi-Fi exit codes", () => {
+  eq(M.helperError(12).key, "error.wifiOff")
+  eq(M.helperError(13).key, "error.usbmuxd")
+  eq(M.helperError(14).key, "error.notOnUsb")
 })
 
 // ------------------------------------------------------------------ i18n catalog

@@ -16,8 +16,12 @@ var DEFAULT_BITRATE = 20
 
 var ID_RE = /^[0-9A-Fa-f][0-9A-Fa-f-]{7,63}$/
 var ADDR_RE = /^[A-Za-z0-9\[][A-Za-z0-9.\-:\[\]]{0,79}:([0-9]{1,5})$/
-var UNIT_RE = /^(opendisplay-[0-9a-f]{8}|opendisplay-addr-[0-9a-f]{8}|od-sender@[A-Za-z0-9\\_.:-]{1,300})\.service$/
+var UNIT_RE = /^(opendisplay-[0-9a-f]{8}|opendisplay-(?:addr|usb)-[0-9a-f]{8}|od-sender@[A-Za-z0-9\\_.:-]{1,300})\.service$/
 var OUTPUT_RE = /^od-[0-9a-f]{6}$/
+var UDID_RE = /^[0-9A-Fa-f][0-9A-Fa-f-]{15,63}$/
+// How a session reaches its receiver, from the helper's status.
+var VIAS = ["usb", "wifi", "tailscale"]
+var USB_STATES = ["running", "installed", "missing"]
 
 var PRESETS = [
   { name: "sharp", bitrate: 35 },
@@ -116,6 +120,60 @@ function parseList(raw) {
   return { ok: true, items: items }
 }
 
+// usb-list: receivers plugged in by USB, [{udid, deviceId, id, name, pv}].
+function parseUsbList(raw) {
+  var parsed = parseJson(raw)
+  if (!parsed.ok || !(parsed.value instanceof Array)) return { ok: false, items: [] }
+  var items = []
+  var seen = {}
+  for (var i = 0; i < parsed.value.length && items.length < MAX_RECEIVERS; i++) {
+    var r = parsed.value[i]
+    if (!r || typeof r !== "object" || !isValidId(r.id) || !UDID_RE.test(String(r.udid))) continue
+    var key = r.id.toUpperCase()
+    if (seen[key]) continue
+    seen[key] = true
+    var name = clampText(r.name, MAX_NAME)
+    items.push({ id: r.id, name: name !== "" ? name : r.id.substring(0, 8), udid: r.udid })
+  }
+  return { ok: true, items: items }
+}
+
+function onUsb(usb, id) {
+  var list = usb instanceof Array ? usb : []
+  for (var i = 0; i < list.length; i++) if (sameId(list[i].id, id)) return true
+  return false
+}
+
+// Which helper command connects a receiver: USB when it's plugged in (it's
+// faster and works with Wi-Fi connections off), else Wi-Fi if allowed.
+// Returns "usb", "wifi" or "" (Wi-Fi off and not on USB).
+function connectRoute(id, usb, wifiEnabled) {
+  if (!isValidId(id)) return ""
+  if (onUsb(usb, id)) return "usb"
+  return wifiEnabled === false ? "" : "wifi"
+}
+
+// The label for a live session's link. The plugin knows USB and Tailscale
+// sessions from how they were started; otherwise the receiver's own report
+// (PHONE-STATS) wins, and Wi-Fi is the default.
+function linkLabel(via, live) {
+  if (via === "usb") return "USB"
+  if (via === "tailscale") return "Tailscale"
+  var t = transportLabel(live || "")
+  return t !== "" ? t : "Wi-Fi"
+}
+
+// What a finished `list` means for the error line: a failure sets
+// error.scanFailed; a success clears only that error, never another one.
+function scanErrorAction(ok, installed, errorKey) {
+  if (ok) return errorKey === "error.scanFailed" ? "clear" : "keep"
+  return installed ? "set" : "keep"
+}
+
+function isLoopbackAddr(addr) {
+  return /^(127\.[0-9.]+|localhost|\[::1\]):[0-9]+$/.test(String(addr || ""))
+}
+
 // ------------------------------------------------------------------ helper status --json
 
 function toInt(value, fallback) {
@@ -125,11 +183,13 @@ function toInt(value, fallback) {
 
 function parseStatus(raw) {
   var parsed = parseJson(raw)
-  var out = { ok: false, sessions: [], units: [], autoconnect: [], templateInstalled: false }
+  var out = { ok: false, sessions: [], units: [], autoconnect: [], templateInstalled: false, wifi: true, usb: "missing" }
   if (!parsed.ok || !parsed.value || typeof parsed.value !== "object") return out
   var v = parsed.value
   out.ok = true
   out.templateInstalled = v.templateInstalled === true
+  out.wifi = v.wifi !== false
+  out.usb = USB_STATES.indexOf(v.usb) !== -1 ? v.usb : "missing"
   var list = v.sessions instanceof Array ? v.sessions : []
   for (var i = 0; i < list.length && out.sessions.length < MAX_RECEIVERS; i++) {
     var s = list[i]
@@ -140,7 +200,8 @@ function parseStatus(raw) {
       unit: isValidUnit(s.unit) ? s.unit : "",
       id: isValidId(s.id) ? s.id : "",
       to: clampText(s.to, 96),
-      since: toInt(s.since, 0)
+      since: toInt(s.since, 0),
+      via: VIAS.indexOf(s.transport) !== -1 ? s.transport : "wifi"
     })
   }
   var units = v.units instanceof Array ? v.units : []
@@ -156,7 +217,8 @@ function parseStatus(raw) {
       id: isValidId(u.id) ? u.id : "",
       to: clampText(u.to, 96),
       status: toInt(u.status, 0),
-      since: toInt(u.since, 0)
+      since: toInt(u.since, 0),
+      via: VIAS.indexOf(u.transport) !== -1 ? u.transport : "wifi"
     })
   }
   var auto = v.autoconnect instanceof Array ? v.autoconnect : []
@@ -452,8 +514,17 @@ function idForOutput(output, discovered, known) {
 // others: discovered receivers that aren't live (possibly connecting), plus
 // offline receivers with auto-connect on: waiting when their template unit
 // is running, paused when it isn't (e.g. the user disconnected it).
-function mergeReceivers(discovered, known, sessions, autoIds, now) {
-  var disc = discovered instanceof Array ? discovered : []
+//
+// usb (from usb-list) adds receivers plugged in by USB: a row seen on both is
+// one row with usb: true; one seen only on USB is listed too.
+function mergeReceivers(discovered, known, sessions, autoIds, now, usb) {
+  var usbList = usb instanceof Array ? usb : []
+  var disc = (discovered instanceof Array ? discovered : []).slice()
+  for (var u = 0; u < usbList.length; u++) {
+    var dup = false
+    for (var d0 = 0; d0 < disc.length; d0++) if (sameId(disc[d0].id, usbList[u].id)) dup = true
+    if (!dup) disc.push({ id: usbList[u].id, name: usbList[u].name, addr: "", pv: 0 })
+  }
   var knownList = sanitizeKnown(known)
   var sess = sessions instanceof Array ? sessions : []
   var autos = autoIds instanceof Array ? autoIds : []
@@ -484,7 +555,7 @@ function mergeReceivers(discovered, known, sessions, autoIds, now) {
       if (isValidId(s.id)) connecting[s.id.toUpperCase()] = s
       else if (s.state === "connecting") {
         others.push({ key: s.key, id: "", name: s.name || s.to || "", addr: s.to || "", state: "connecting",
-          autoConnect: false, lastUsedDays: -1, unit: s.unit || "" })
+          autoConnect: false, lastUsedDays: -1, unit: s.unit || "", usb: false })
       }
       continue
     }
@@ -508,7 +579,8 @@ function mergeReceivers(discovered, known, sessions, autoIds, now) {
       state: c ? c.state : "idle",
       autoConnect: isAuto(r.id),
       lastUsedDays: k ? relativeDays(k.lastUsed, now) : -1,
-      unit: c ? (c.unit || "") : ""
+      unit: c ? (c.unit || "") : "",
+      usb: onUsb(usbList, r.id)
     })
   }
 
@@ -530,7 +602,8 @@ function mergeReceivers(discovered, known, sessions, autoIds, now) {
         : (auto ? (cs && cs.state === "waiting" ? "waiting" : "paused") : "idle"),
       autoConnect: auto,
       lastUsedDays: kk ? relativeDays(kk.lastUsed, now) : -1,
-      unit: cs ? (cs.unit || "") : ""
+      unit: cs ? (cs.unit || "") : "",
+      usb: false
     })
   }
   return { cards: cards, others: others }
@@ -568,6 +641,7 @@ function buildSessions(status, live, pending, discovered, known, now) {
     out.push({
       key: key, id: id, unit: s.unit, output: s.output, pid: s.pid, to: s.to,
       external: s.unit === "", template: s.unit.indexOf("od-sender@") === 0,
+      via: s.via || "wifi",
       name: l.name || "", state: state,
       fps: l.fps === undefined ? -1 : l.fps,
       mbps: l.mbps === undefined ? -1 : l.mbps,
@@ -583,7 +657,7 @@ function buildSessions(status, live, pending, discovered, known, now) {
     seen[u.unit] = true
     out.push(blank({
       key: u.unit, id: u.id || ul.id || "", unit: u.unit, output: "", to: u.to, external: false,
-      template: u.template, name: ul.name || "", state: u.template ? "waiting" : "connecting"
+      template: u.template, via: u.via || "wifi", name: ul.name || "", state: u.template ? "waiting" : "connecting"
     }))
   }
 
@@ -592,7 +666,7 @@ function buildSessions(status, live, pending, discovered, known, now) {
     if (hasSessionId(out, pid)) continue
     out.push(blank({
       key: "pending:" + String(pid).toUpperCase(), id: pid, unit: "", output: "", to: "", external: false,
-      template: false, name: "", state: "connecting"
+      template: false, via: pd[p].via || "wifi", name: "", state: "connecting"
     }))
   }
   return out
@@ -650,6 +724,11 @@ function reconcilePending(pending, pendingUnits, status, now) {
   return { pending: np, pendingUnits: nu, failures: failures }
 }
 
+// A USB session connects to a loopback forwarder; that's no address to remember.
+function usedAddr(addr) {
+  return addr && !isLoopbackAddr(addr) ? addr : ""
+}
+
 // Folds one parsed log line into a unit's live entry.
 function reduceLive(entry, parsed, now, opts) {
   var l = {}
@@ -663,7 +742,7 @@ function reduceLive(entry, parsed, now, opts) {
     if (r.kind === "connected" && !l.addr) l.addr = r.addr
     if (identity && r.name !== "" && !l.name) l.name = r.name
     if (identity && r.id !== "" && !l.id) l.id = r.id
-    if (r.kind === "extending" && l.id) fx.used = { id: l.id, name: l.name || "", addr: l.addr || "", ts: r.ts > 0 ? r.ts : now }
+    if (r.kind === "extending" && l.id) fx.used = { id: l.id, name: l.name || "", addr: usedAddr(l.addr), ts: r.ts > 0 ? r.ts : now }
     return { entry: l, effects: fx }
   }
 
@@ -684,7 +763,7 @@ function reduceLive(entry, parsed, now, opts) {
     if (r.name !== "") l.name = r.name
     if (r.id !== "") l.id = r.id
     fx.needStatus = true
-    if (l.id) fx.used = { id: l.id, name: l.name || "", addr: l.addr || "", ts: r.ts > 0 ? r.ts : now }
+    if (l.id) fx.used = { id: l.id, name: l.name || "", addr: usedAddr(l.addr), ts: r.ts > 0 ? r.ts : now }
     fx.notifyConnected = r.ts > 0 && r.ts >= (o.tailStartMs || 0) - 2000
   } else if (r.kind === "ended") {
     fx.needStatus = true
@@ -716,11 +795,11 @@ function pick(list, fields) {
 
 // Structure only (no live stats), so a stats tick doesn't rebuild the lists.
 function cardsSignature(cards) {
-  return pick(cards instanceof Array ? cards : [], ["key", "id", "name", "state", "autoConnect", "external", "template", "unit", "output"])
+  return pick(cards instanceof Array ? cards : [], ["key", "id", "name", "state", "autoConnect", "external", "template", "unit", "output", "via"])
 }
 
 function othersSignature(others) {
-  return pick(others instanceof Array ? others : [], ["key", "id", "name", "addr", "state", "autoConnect", "lastUsedDays", "unit"])
+  return pick(others instanceof Array ? others : [], ["key", "id", "name", "addr", "state", "autoConnect", "lastUsedDays", "unit", "usb"])
 }
 
 // Helper exit code to i18n key. "" means show the raw stderr line.
@@ -733,6 +812,9 @@ function helperError(code) {
   if (code === 9) return { key: "error.externalSender", doctor: false }
   if (code === 10) return { key: "error.packageManaged", doctor: false }
   if (code === 11) return { key: "error.offline", doctor: false }
+  if (code === 12) return { key: "error.wifiOff", doctor: false }
+  if (code === 13) return { key: "error.usbmuxd", doctor: false }
+  if (code === 14) return { key: "error.notOnUsb", doctor: false }
   return { key: "", doctor: false }
 }
 

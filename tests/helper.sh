@@ -244,6 +244,227 @@ plan="$(python3 -I "$UTIL" install-plan <<< '{"sessions": [{"unit": null}], "uni
   {"unit": "opendisplay-a0ec2343.service", "state": "active", "template": false, "to": "x"}]}')"
 check "install-plan reports EXTERNAL for a session outside units" [ "$plan" = EXTERNAL ]
 
+plan="$(python3 -I "$UTIL" install-plan <<< '{"sessions": [], "units": [
+  {"unit": "opendisplay-usb-a0ec2343.service", "state": "active", "template": false, "to": "A0EC2343-F05E"}]}')"
+check "install-plan lists usb units" [ "$plan" = "usb opendisplay-usb-a0ec2343.service A0EC2343-F05E" ]
+wu="$(python3 -I "$UTIL" wifi-units <<< '{"sessions": [], "units": [
+  {"unit": "od-sender@x.service", "state": "active", "template": true},
+  {"unit": "opendisplay-a0ec2343.service", "state": "activating", "template": false},
+  {"unit": "opendisplay-addr-0123abcd.service", "state": "active", "template": false},
+  {"unit": "opendisplay-usb-a0ec2343.service", "state": "active", "template": false},
+  {"unit": "opendisplay-deadbeef.service", "state": "failed", "template": false}]}')"
+check "wifi-units lists network sessions, never USB ones" [ "$wu" = "od-sender@x.service
+opendisplay-a0ec2343.service
+opendisplay-addr-0123abcd.service" ]
+
+# --- USB --------------------------------------------------------------------
+
+USB_UNIT="opendisplay-usb-a0ec2343.service"
+UDID="00008027-0014490A1AE8002E"
+check "usb unit name" [ "$("$HELPER" usb-unit "$ID")" = "$USB_UNIT" ]
+check "usb-unit rejects a bad id" [ "$(code_of "$HELPER" usb-unit "-x")" = 2 ]
+check "connect-usb rejects a bad id" [ "$(code_of "$HELPER" connect-usb "-rf")" = 2 ]
+
+export USBMUXD_SOCKET_ADDRESS="UNIX:$T/no-usbmuxd"
+check "usb-list without usbmuxd is []" [ "$("$HELPER" usb-list)" = "[]" ]
+check "connect-usb without usbmuxd exits 13" [ "$(code_of "$HELPER" connect-usb "$ID")" = 13 ]
+check "usbmuxd state is reported in status" bash -c '[[ $("$0" status) =~ \"usb\":\ \"(installed|missing)\" ]]' "$HELPER"
+
+# A fake usbmuxd: one wired device (plus a Wi-Fi-paired one that must be
+# ignored) whose port 9000 answers with a receiver hello. Counts Connects.
+cat > "$T/fake-usbmuxd.py" <<'EOF'
+import json, os, plistlib, socket, struct, sys, threading
+path, count = sys.argv[1], sys.argv[2]
+def read(c):
+    h = b""
+    while len(h) < 16:
+        d = c.recv(16 - len(h))
+        if not d: return None
+        h += d
+    n = struct.unpack("<IIII", h)[0] - 16
+    b = b""
+    while len(b) < n: b += c.recv(n - len(b))
+    return plistlib.loads(b)
+def send(c, msg):
+    body = plistlib.dumps(msg)
+    c.sendall(struct.pack("<IIII", 16 + len(body), 1, 8, 1) + body)
+def serve(c):
+    msg = read(c)
+    t = msg and msg.get("MessageType")
+    if t == "ListDevices":
+        send(c, {"DeviceList": [
+            {"DeviceID": 7, "Properties": {"ConnectionType": "USB", "DeviceID": 7, "SerialNumber": "00008027-0014490A1AE8002E"}},
+            {"DeviceID": 8, "Properties": {"ConnectionType": "Network", "DeviceID": 8, "SerialNumber": "00008027-0000000000000BAD"}}]})
+    elif t == "Listen":
+        send(c, {"MessageType": "Result", "Number": 0})
+        threading.Event().wait()  # no events: the device stays plugged in
+    elif t == "Connect":
+        with open(count, "a") as f: f.write("connect\n")
+        ok = msg.get("DeviceID") == 7 and msg.get("PortNumber") == socket.htons(9000)
+        send(c, {"MessageType": "Result", "Number": 0 if ok else 3})
+        if ok:
+            hello = json.dumps({"type": "hello", "id": "A0EC2343-F05E-4776-8903-8C62BB114896", "device": "iPad\u0007", "pv": 3}).encode()
+            c.sendall(struct.pack(">I", len(hello)) + hello)
+    c.close()
+s = socket.socket(socket.AF_UNIX)
+s.bind(path)
+s.listen(8)
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()
+EOF
+python3 -I "$T/fake-usbmuxd.py" "$T/usbmuxd.sock" "$T/connects" &
+FAKE_MUX=$!
+for _ in $(seq 50); do [[ -S $T/usbmuxd.sock ]] && break; sleep 0.1; done
+export USBMUXD_SOCKET_ADDRESS="UNIX:$T/usbmuxd.sock"
+ul="$("$HELPER" usb-list)"
+check "usb-list finds the wired receiver by its hello" [ "$ul" = "[{\"udid\": \"$UDID\", \"deviceId\": 7, \"id\": \"$ID\", \"name\": \"iPad\", \"pv\": 3}]" ]
+"$HELPER" usb-list >/dev/null
+check "usb-list probes a device once per DeviceID (cache)" [ "$(wc -l < "$T/connects")" = 1 ]
+check "the cache lives in the runtime dir" [ -s "$XDG_RUNTIME_DIR/omarchy-opendisplay/usb-cache.json" ]
+check "usbmuxd shows as running in status" bash -c '[[ $("$0" status) == *"\"usb\": \"running\""* ]]' "$HELPER"
+check "connect-usb for a receiver not on USB exits 14" [ "$(code_of "$HELPER" connect-usb "BEEF0000-0000-0000-0000-000000000001")" = 14 ]
+check "usb-list leaves no temp files beside the cache" bash -c '! ls "$0"/.usb-cache.* 2>/dev/null' "$XDG_RUNTIME_DIR/omarchy-opendisplay"
+BEEF_TPL='od-sender@BEEF0000\x2d0000\x2d0000\x2d0000\x2d000000000001.service'
+reset_fake
+set_unit "$BEEF_TPL" active
+"$HELPER" connect-usb "BEEF0000-0000-0000-0000-000000000001" >/dev/null 2>&1
+check "connect-usb leaves auto-connect alone when the device isn't on USB" [ "$(cat "$FAKE/units/${BEEF_TPL//\//_}")" = active ]
+
+# usbmux.py run: forwards only its own od-sender's connections, and a
+# requested stop escalates past a sender that ignores SIGINT and exits 0.
+cat > "$T/fake-sender" <<'EOF'
+#!/usr/bin/env bash
+trap '' INT
+trap 'echo TERM >> "$FAKE/sender-signals"; exit 3' TERM
+port="${2##*:}"
+printf '%s\n' "$@" > "$FAKE/sender-args.tmp"
+exec 3<>"/dev/tcp/127.0.0.1/$port"
+head -c 4 <&3 > "$FAKE/sender-got"
+mv "$FAKE/sender-args.tmp" "$FAKE/sender-args"
+while :; do sleep 0.1; done
+EOF
+chmod +x "$T/fake-sender"
+rm -f "$FAKE/sender-args" "$FAKE/sender-got" "$FAKE/sender-signals" "$T/connects"
+python3 -I "$ROOT/bin/usbmux.py" run --udid="$UDID" --sender="$T/fake-sender" 2>"$T/run.err" &
+RUN_PID=$!
+for _ in $(seq 100); do [[ -e $FAKE/sender-args ]] && break; sleep 0.1; done
+check "run starts od-sender on a loopback port" grep -qE '^--to=127\.0\.0\.1:[0-9]+$' "$FAKE/sender-args"
+check "run forwards od-sender's own connection to the device" [ "$(wc -c < "$FAKE/sender-got" 2>/dev/null)" = 4 ]
+port="$(sed -n 's/^--to=127\.0\.0\.1://p' "$FAKE/sender-args")"
+got="$(python3 -I -c 'import socket,sys
+s=socket.create_connection(("127.0.0.1",int(sys.argv[1])),2); s.settimeout(2)
+try: print(len(s.recv(4)))
+except OSError: print(-1)' "$port")"
+check "run refuses connections from other local programs" [ "$got" = 0 ]
+check "a refused connection never reaches the device" [ "$(wc -l < "$T/connects")" = 1 ]
+start=$SECONDS
+kill -TERM "$RUN_PID"
+wait "$RUN_PID"
+rc=$?
+check "a requested stop exits 0 whatever od-sender returns" [ $rc -eq 0 ]
+check "stop escalates to SIGTERM when od-sender ignores SIGINT" grep -q TERM "$FAKE/sender-signals"
+check "escalation waits for SIGINT first" [ $((SECONDS - start)) -ge 4 ]
+check "run logged the refusal" grep -q "refused a local connection" "$T/run.err"
+
+reset_fake
+set_unit "$TEMPLATE" active
+"$HELPER" connect-usb "$ID" >/dev/null
+run="$(cat "$FAKE/systemd-run" 2>/dev/null)"
+check "connect-usb uses the usb unit" contains "$run" "--unit=$USB_UNIT"
+check "connect-usb keeps the description contract" contains "$run" "--description=OpenDisplay to $ID"
+check "connect-usb runs usbmux.py isolated" grep -qx -- "-I" "$FAKE/systemd-run"
+check "connect-usb passes the UDID" grep -qx -- "--udid=$UDID" "$FAKE/systemd-run"
+check "connect-usb passes od-sender's path" grep -q -- "^--sender=/" "$FAKE/systemd-run"
+check "connect-usb passes the usbmuxd socket on" grep -qx -- "--setenv=USBMUXD_SOCKET_ADDRESS=UNIX:$T/usbmuxd.sock" "$FAKE/systemd-run"
+check "connect-usb has Restart=no" grep -qx -- "--property=Restart=no" "$FAKE/systemd-run"
+check "connect-usb has KillMode=mixed" grep -qx -- "--property=KillMode=mixed" "$FAKE/systemd-run"
+check "connect-usb stops a waiting auto-connect sender" grep -qF "systemctl --user stop -- $TEMPLATE" "$FAKE/calls"
+check "connect-usb doesn't disable auto-connect" bash -c '! grep -q " disable " "$0"' "$FAKE/calls"
+rm -f "$FAKE/systemd-run"
+"$HELPER" connect-usb "$ID" >/dev/null
+check "connect-usb is a no-op when the usb unit is active" [ ! -e "$FAKE/systemd-run" ]
+check "connect (Wi-Fi) is a no-op while a USB session runs" bash -c '"$0" connect "$1" | grep -q "already connected" && [ ! -e "$2" ]' "$HELPER" "$ID" "$FAKE/systemd-run"
+s="$("$HELPER" status)"
+check "status marks the usb unit's transport" contains "$s" '"transport": "usb"'
+set_unit "opendisplay-addr-0123abcd.service" active
+printf 'OpenDisplay to 127.0.0.1:9000' > "$FAKE/desc/opendisplay-addr-0123abcd.service"
+check "a loopback connect-by-IP unit isn't labelled USB" python3 -I -c 'import json,sys
+u={x["unit"]:x for x in json.load(sys.stdin)["units"]}
+assert u["opendisplay-addr-0123abcd.service"]["transport"]=="wifi"' <<< "$("$HELPER" status)"
+set_unit "opendisplay-addr-0123abcd.service" inactive
+check "status takes the usb unit's id from its description" contains "$s" "\"id\": \"$ID\""
+set_unit "$TRANSIENT" active
+rm -f "$FAKE/calls"
+"$HELPER" restart "$ID"
+check "restart prefers the usb unit over the Wi-Fi one" grep -q "^systemctl --user restart -- $USB_UNIT" "$FAKE/calls"
+rm -f "$FAKE/calls"
+"$HELPER" disconnect "$ID"
+check "disconnect <id> stops the usb unit" grep -q "^systemctl --user stop -- $USB_UNIT" "$FAKE/calls"
+kill "$FAKE_MUX" 2>/dev/null
+wait "$FAKE_MUX" 2>/dev/null
+unset USBMUXD_SOCKET_ADDRESS
+python3 -I "$ROOT/bin/usbmux.py" run --udid=nope >/dev/null 2>&1
+check "usbmux.py run rejects a bad UDID" [ $? -eq 2 ]
+reset_fake
+
+# --- Wi-Fi connections toggle -----------------------------------------------
+
+WIFI_FLAG="$XDG_CONFIG_HOME/omarchy-opendisplay/wifi-disabled"
+DROPIN="$XDG_CONFIG_HOME/systemd/user/od-sender@.service.d/omarchy-opendisplay-wifi.conf"
+check "wifi is on by default" [ "$("$HELPER" wifi status)" = on ]
+check "status says wifi on" contains "$("$HELPER" status)" '"wifi": true'
+check "wifi rejects other arguments" [ "$(code_of "$HELPER" wifi maybe)" = 2 ]
+set_unit "$TRANSIENT" active
+set_unit "$TEMPLATE" active
+set_unit "opendisplay-addr-0123abcd.service" active
+set_unit "$USB_UNIT" active
+rm -f "$STAMP"
+"$HELPER" wifi off >/dev/null
+check "wifi off writes the flag file" [ -e "$WIFI_FLAG" ]
+check "wifi off writes the change stamp" [ -s "$STAMP" ]
+check "wifi off installs the auto-connect drop-in" grep -qF "ExecCondition=test ! -e \"$WIFI_FLAG\"" "$DROPIN"
+check "wifi off reloads systemd" grep -q "^systemctl --user daemon-reload" "$FAKE/calls"
+check "wifi off stops the Wi-Fi session" [ "$(cat "$FAKE/units/$TRANSIENT")" = inactive ]
+check "wifi off stops connect-by-IP sessions" [ "$(cat "$FAKE/units/opendisplay-addr-0123abcd.service")" = inactive ]
+check "wifi off stops running auto-connect senders" [ "$(cat "$FAKE/units/${TEMPLATE//\//_}")" = inactive ]
+check "wifi off keeps USB sessions" [ "$(cat "$FAKE/units/$USB_UNIT")" = active ]
+check "wifi off doesn't disable auto-connect" bash -c '! grep -q " disable " "$0"' "$FAKE/calls"
+check "wifi status says off" [ "$("$HELPER" wifi status)" = off ]
+check "status says wifi off" contains "$("$HELPER" status)" '"wifi": false'
+check "list doesn't scan with Wi-Fi off" [ "$("$HELPER" list)" = "[]" ]
+check "connect is refused with Wi-Fi off (exit 12)" [ "$(code_of "$HELPER" connect "$ID")" = 12 ]
+check "connect-addr is refused with Wi-Fi off (exit 12)" [ "$(code_of "$HELPER" connect-addr 10.93.10.226:9000)" = 12 ]
+err="$("$HELPER" connect "$ID" 2>&1 >/dev/null)"
+check "the refusal says why" contains "$err" "Wi-Fi connections are turned off"
+set_unit "$TRANSIENT" active
+set_unit "$USB_UNIT" inactive
+check "restart of a Wi-Fi unit is refused with Wi-Fi off (exit 12)" [ "$(code_of "$HELPER" restart "$TRANSIENT")" = 12 ]
+check "restart <id> of a Wi-Fi session is refused with Wi-Fi off (exit 12)" [ "$(code_of "$HELPER" restart "$ID")" = 12 ]
+set_unit "$TRANSIENT" inactive
+check "restart of a USB unit still works with Wi-Fi off" [ "$(code_of "$HELPER" restart "$USB_UNIT")" = 0 ]
+set_unit "$USB_UNIT" inactive
+mkdir -p "$XDG_CONFIG_HOME/systemd/user/default.target.wants"
+touch "$XDG_CONFIG_HOME/systemd/user/default.target.wants/$TEMPLATE"
+rm -f "$FAKE/calls"
+"$HELPER" wifi on >/dev/null
+check "wifi on removes the flag file" [ ! -e "$WIFI_FLAG" ]
+check "wifi on removes the drop-in" [ ! -e "$DROPIN" ]
+check "wifi on restarts enabled auto-connect units" grep -qF "systemctl --user start -- $TEMPLATE" "$FAKE/calls"
+"$HELPER" wifi off >/dev/null
+set_unit "$USB_UNIT" active
+set_unit "$TEMPLATE" inactive
+rm -f "$FAKE/calls"
+"$HELPER" wifi on >/dev/null
+check "wifi on skips auto-connect for a receiver connected by USB" bash -c '! grep -qF "start -- $1" "$0"' "$FAKE/calls" "$TEMPLATE"
+XDG_CONFIG_HOME="$T/odd\$cfg%" "$HELPER" wifi off >/dev/null
+check "the drop-in escapes \$ and % in the flag path" grep -qF 'ExecCondition=test ! -e "'"$T"'/odd$$cfg%%/omarchy-opendisplay/wifi-disabled"' "$T/odd\$cfg%/systemd/user/od-sender@.service.d/omarchy-opendisplay-wifi.conf"
+XDG_CONFIG_HOME="$T/odd\$cfg%" "$HELPER" wifi on >/dev/null
+check "list scans again with Wi-Fi on" contains "$("$HELPER" list)" "fake od-sender list"
+rm -f "$XDG_CONFIG_HOME/systemd/user/default.target.wants/$TEMPLATE"
+rmdir "$XDG_CONFIG_HOME/systemd/user/default.target.wants" 2>/dev/null
+reset_fake
+
 # --- version ----------------------------------------------------------------
 
 v="$("$HELPER" version)"

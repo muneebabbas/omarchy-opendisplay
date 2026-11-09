@@ -119,7 +119,7 @@ if [[ ${1-} != --tests-only ]]; then
 
   if rf="$(ruff_cmd)"; then
     # shellcheck disable=SC2086
-    step "ruff" $rf check bin/sender-config.py bin/opendisplay-util.py
+    step "ruff" $rf check bin/sender-config.py bin/opendisplay-util.py bin/usbmux.py
   else
     missing "ruff" "ruff (or uv)"
   fi

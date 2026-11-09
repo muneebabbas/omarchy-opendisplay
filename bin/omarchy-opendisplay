@@ -5,6 +5,8 @@
 # run as systemd user units so they outlive shell restarts:
 #   manual connect   opendisplay-<id8>.service        (transient, systemd-run)
 #   connect by IP    opendisplay-addr-<sha1-8>.service (transient)
+#   connect by USB   opendisplay-usb-<id8>.service    (transient; bin/usbmux.py
+#                    forwards a loopback port to the device and runs od-sender)
 #   auto-connect     od-sender@<escaped id>.service   (upstream template unit)
 #
 # Every value from outside is validated before use and always passed as a
@@ -15,17 +17,26 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 PY=(python3 -I)
 UTIL="$HERE/opendisplay-util.py"
+USBMUX="$HERE/usbmux.py"
 CONFIG_TOOL="$HERE/sender-config.py"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-opendisplay"
 RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 LOCKS="$RUNTIME/opendisplay"
 STATE="$RUNTIME/omarchy-opendisplay"
+SETTINGS="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-opendisplay"
+# Wi-Fi connections are off while this file exists (the single source of
+# truth; opendisplay-util.py reads it for status, and the od-sender@ drop-in
+# below checks it before every auto-connect start).
+WIFI_OFF="$SETTINGS/wifi-disabled"
+DROPIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/od-sender@.service.d"
+DROPIN="$DROPIN_DIR/omarchy-opendisplay-wifi.conf"
 RELEASE_API="https://api.github.com/repos/peetzweg/opendisplay/releases/latest"
 CURL=(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --max-time 60)
 
 ID_RE='^[0-9A-Fa-f][0-9A-Fa-f-]{7,63}$'
 ADDR_RE='^[[A-Za-z0-9][]A-Za-z0-9.:[-]{0,79}:([0-9]{1,5})$'
-UNIT_RE='^(opendisplay-[0-9a-f]{8}|opendisplay-addr-[0-9a-f]{8}|od-sender@[A-Za-z0-9\\_.:-]{1,300})\.service$'
+UNIT_RE='^(opendisplay-[0-9a-f]{8}|opendisplay-(addr|usb)-[0-9a-f]{8}|od-sender@[A-Za-z0-9\\_.:-]{1,300})\.service$'
+UDID_RE='^[0-9A-Fa-f][0-9A-Fa-f-]{15,63}$'
 
 # The transient units' Description is "<DESC_PREFIX><to>"; opendisplay-util.py
 # parses it back (DESC_PREFIX there). Keep the two in sync.
@@ -36,8 +47,9 @@ export NO_COLOR=1
 # Exit codes (also listed in usage): 0 ok, 1 other failure, 2 invalid argument
 # or usage, 5 config saved but doctor unhappy, 6 config rejected and rolled
 # back, 7 template unit missing, 8 od-sender not installed, 9 external sender
-# running, 10 managed by pacman, 11 GitHub unreachable. The message is always
-# the last line of stderr.
+# running, 10 managed by pacman, 11 GitHub unreachable, 12 Wi-Fi connections
+# are off, 13 usbmuxd isn't available, 14 receiver isn't connected by USB. The
+# message is always the last line of stderr.
 die_code() { local code="$1"; shift; printf '%s\n' "$*" >&2; exit "$code"; }
 die() { die_code 1 "$*"; }
 
@@ -73,6 +85,12 @@ addr_unit() {  # <host:port>
   local sum
   sum="$(printf '%s' "$1" | sha1sum)"
   printf 'opendisplay-addr-%s.service' "${sum:0:8}"
+}
+
+usb_unit() {  # <id>
+  local hex="${1//-/}"
+  hex="${hex,,}"
+  printf 'opendisplay-usb-%s.service' "${hex:0:8}"
 }
 
 template_unit() {  # <id>
@@ -138,6 +156,8 @@ print("" if v is None else (str(v).lower() if isinstance(v, bool) else v))' "$1"
 
 start_transient() {  # <unit> <to>
   local unit="$1" to="$2"
+  # Every network connect goes through here, including restores after an update.
+  wifi_enabled || { echo "Wi-Fi connections are turned off" >&2; return 12; }
   case "$(unit_state "$unit")" in
     active|activating) echo "already connected"; return 0 ;;
     failed) systemctl --user reset-failed -- "$unit" 2>/dev/null ;;
@@ -148,19 +168,92 @@ start_transient() {  # <unit> <to>
   echo "$unit"
 }
 
+wifi_enabled() { [[ ! -e $WIFI_OFF ]]; }
+
+require_wifi() {
+  wifi_enabled || die_code 12 "Wi-Fi connections are turned off"
+}
+
 cmd_connect() {
   need_id "${1-}"
   local id="$1"
+  require_wifi
   require_sender
   if unit_active "$(template_unit "$id")"; then echo "already connected (auto-connect)"; return 0; fi
+  if unit_active "$(usb_unit "$id")"; then echo "already connected (USB)"; return 0; fi
   if lock_pid "$(output_for_id "$id")" >/dev/null; then echo "already connected"; return 0; fi
   start_transient "$(transient_unit "$id")" "$id"
 }
 
 cmd_connect_addr() {
   valid_addr "${1-}" || die_code 2 "invalid address; use host:port"
+  require_wifi
   require_sender
   start_transient "$(addr_unit "$1")" "$1"
+}
+
+# The usbmuxd socket override is passed on to the unit so it talks to the same
+# usbmuxd as this helper; only plain paths and host:port are accepted.
+usbmux_env() {
+  local v="${USBMUXD_SOCKET_ADDRESS-}"
+  [[ -z $v ]] && return 0
+  if [[ $v =~ ^UNIX:/[A-Za-z0-9/._-]{1,200}$ || $v =~ ^[A-Za-z0-9.-]{1,80}:[0-9]{1,5}$ ]]; then
+    printf -- '--setenv=USBMUXD_SOCKET_ADDRESS=%s' "$v"
+  fi
+}
+
+# USB session: one transient unit whose main process is bin/usbmux.py. It
+# listens on a free loopback port, runs `od-sender run --to=127.0.0.1:<port>`
+# as its child (same cgroup, so status, logs and stop work as for any other
+# session), forwards that port to TCP 9000 on the device through usbmuxd, and
+# ends the session when the device is unplugged. Exits with od-sender's code.
+start_usb() {  # <id>
+  local id="$1" unit udid rc=0 py env
+  unit="$(usb_unit "$id")"
+  case "$(unit_state "$unit")" in
+    active|activating) echo "already connected"; return 0 ;;
+    failed) systemctl --user reset-failed -- "$unit" 2>/dev/null ;;
+  esac
+  udid="$("${PY[@]}" "$USBMUX" find "$id")" || rc=$?
+  case "$rc" in
+    0) ;;
+    13) echo "USB needs usbmuxd: sudo pacman -S usbmuxd" >&2; return 13 ;;
+    14) echo "receiver isn't connected by USB" >&2; return 14 ;;
+    *) echo "couldn't look for USB devices" >&2; return 1 ;;
+  esac
+  [[ $udid =~ $UDID_RE ]] || { echo "unexpected UDID from usbmux.py" >&2; return 1; }
+  py="$(command -v python3)" || { echo "python3 not found" >&2; return 1; }
+  # KillMode=mixed: stop SIGTERMs only usbmux.py, which SIGINTs od-sender
+  # (escalating if it hangs) so it can remove its display first.
+  local args=(--user --quiet --unit="$unit" --description="$DESC_PREFIX$id"
+    --setenv=NO_COLOR=1 --property=Restart=no --property=KillMode=mixed)
+  env="$(usbmux_env)"
+  [[ -n $env ]] && args+=("$env")
+  # Only now that the device is known to be on USB: a waiting auto-connect
+  # sender would connect over Wi-Fi as well and fight this one. Stop it (it
+  # stays enabled and starts again at the next login).
+  local tpl
+  tpl="$(template_unit "$id")"
+  if unit_active "$tpl"; then stop_units "$tpl"; fi
+  systemd-run "${args[@]}" -- "$py" -I "$USBMUX" run --udid="$udid" --sender="$SENDER" \
+    || { echo "couldn't start $unit" >&2; return 1; }
+  echo "$unit"
+}
+
+cmd_connect_usb() {
+  need_id "${1-}"
+  local id="$1" rc=0
+  require_sender
+  if unit_active "$(usb_unit "$id")"; then echo "already connected"; return 0; fi
+  if unit_active "$(transient_unit "$id")" || lock_pid "$(output_for_id "$id")" >/dev/null; then
+    echo "already connected"; return 0
+  fi
+  start_usb "$id" || rc=$?
+  (( rc == 0 )) || exit "$rc"
+}
+
+cmd_usb_list() {
+  exec "${PY[@]}" "$USBMUX" list
 }
 
 stop_units() {
@@ -191,7 +284,7 @@ cmd_disconnect() {
     output="$target"  # an external sender whose receiver id isn't known
   else
     need_id "$target"
-    stop_units "$(transient_unit "$target")" "$(template_unit "$target")"
+    stop_units "$(transient_unit "$target")" "$(usb_unit "$target")" "$(template_unit "$target")"
     output="$(output_for_id "$target")"
   fi
   wait_gone "$output" 3 && return 0
@@ -204,20 +297,28 @@ cmd_disconnect() {
   wait_gone "$output" 2 || die "od-sender (pid $pid) didn't stop"
 }
 
+# With Wi-Fi connections off, only USB units may be (re)started.
+require_wifi_for_unit() {  # <unit>
+  [[ $1 == opendisplay-usb-* ]] || require_wifi
+}
+
 cmd_restart() {
   local target="${1-}" u
   if valid_unit "$target"; then
+    require_wifi_for_unit "$target"
     systemctl --user restart -- "$target" || die "couldn't restart $target"
     return
   fi
   need_id "$target"
-  for u in "$(template_unit "$target")" "$(transient_unit "$target")"; do
+  for u in "$(template_unit "$target")" "$(usb_unit "$target")" "$(transient_unit "$target")"; do
     if unit_active "$u"; then
+      require_wifi_for_unit "$u"
       systemctl --user restart -- "$u" || die "couldn't restart $u"
       return
     fi
   done
   if lock_pid "$(output_for_id "$target")" >/dev/null; then
+    require_wifi  # reconnecting an external sender goes over the network
     cmd_disconnect "$target" && cmd_connect "$target"
   fi
 }
@@ -260,8 +361,59 @@ cmd_logs() {
 }
 
 cmd_list() {
+  # No network scanning at all while Wi-Fi connections are off.
+  if ! wifi_enabled; then echo '[]'; return 0; fi
   require_sender
   exec timeout 15 "$SENDER" list --json --timeout 3
+}
+
+# Quotes a path for a systemd unit file: "..." with \, " and % escaped.
+systemd_quote() {
+  local v="$1"
+  v="${v//\\/\\\\}"
+  v="${v//\"/\\\"}"
+  v="${v//%/%%}"
+  v="${v//\$/\$\$}"
+  printf '"%s"' "$v"
+}
+
+cmd_wifi() {
+  case "${1-}" in
+    status|"")
+      if wifi_enabled; then echo on; else echo off; fi ;;
+    off)
+      mkdir -p "$SETTINGS" "$DROPIN_DIR" || die "couldn't create $SETTINGS"
+      : > "$WIFI_OFF" || die "couldn't write $WIFI_OFF"
+      # Auto-connect units stay enabled (the user's choice) but are skipped
+      # while the flag exists; ExecCondition makes a skip a clean no-op.
+      printf '# Written by the OpenDisplay Omarchy widget; removed when Wi-Fi connections are turned back on.\n[Service]\nExecCondition=test ! -e %s\n' \
+        "$(systemd_quote "$WIFI_OFF")" > "$DROPIN" || die "couldn't write $DROPIN"
+      systemctl --user daemon-reload 2>/dev/null
+      # Disconnect every running Wi-Fi session (USB sessions keep running).
+      local status unit
+      status="$("${PY[@]}" "$UTIL" status)"
+      while read -r unit; do
+        [[ -n $unit ]] && valid_unit "$unit" && stop_units "$unit"
+      done < <("${PY[@]}" "$UTIL" wifi-units <<< "$status")
+      echo off ;;
+    on)
+      rm -f -- "$WIFI_OFF" "$DROPIN"
+      rmdir -- "$DROPIN_DIR" "$SETTINGS" 2>/dev/null
+      systemctl --user daemon-reload 2>/dev/null
+      # Enabled auto-connect units were skipped while Wi-Fi was off; start
+      # them, except for a receiver already connected (say, by USB), where a
+      # second sender would fight the first.
+      local id
+      while read -r id; do
+        valid_id "$id" || continue
+        unit_active "$(usb_unit "$id")" && continue
+        unit_active "$(transient_unit "$id")" && continue
+        lock_pid "$(output_for_id "$id")" >/dev/null && continue
+        systemctl --user start -- "$(template_unit "$id")" 2>/dev/null
+      done < <("${PY[@]}" "$UTIL" autoconnect-ids)
+      echo on ;;
+    *) die_code 2 "usage: wifi on|off|status" ;;
+  esac
 }
 
 # The last ERROR line of a unit's most recent run, for a connect that failed
@@ -381,6 +533,7 @@ restore_units() {
       template) valid_unit "$unit" && systemctl --user start -- "$unit" ;;
       id) valid_id "$to" && start_transient "$(transient_unit "$to")" "$to" >/dev/null ;;
       addr) valid_addr "$to" && start_transient "$(addr_unit "$to")" "$to" >/dev/null ;;
+      usb) valid_id "$to" && [[ -n $SENDER ]] && start_usb "$to" >/dev/null ;;
       *) false ;;
     esac || { echo "couldn't restart $unit" >&2; RESTORE_FAILED=1; }
   done <<< "$PLAN"
@@ -523,6 +676,13 @@ press_any_key() { echo; read -rsn1 -p 'Press any key to close' || true; }
 
 cmd_doctor_run() {
   if require_sender_quiet; then "$SENDER" doctor; echo "(exit $?)"; else echo "od-sender is not installed"; fi
+  echo
+  if wifi_enabled; then echo "Wi-Fi connections: on"; else echo "Wi-Fi connections: off (USB only, no network scanning)"; fi
+  case "$("${PY[@]}" "$USBMUX" state 2>/dev/null)" in
+    running) echo "USB: usbmuxd is running"; "${PY[@]}" "$USBMUX" list 2>/dev/null ;;
+    installed) echo "USB: usbmuxd is installed (it starts when an iPhone or iPad is plugged in)" ;;
+    *) echo "USB needs usbmuxd: sudo pacman -S usbmuxd" ;;
+  esac
   press_any_key
 }
 
@@ -540,6 +700,9 @@ usage: omarchy-opendisplay <command> [args]
 Commands
   connect <id>                 connect a receiver
   connect-addr <host:port>     connect by address
+  connect-usb <id>             connect a receiver plugged in by USB (needs usbmuxd)
+  usb-list                     receivers on USB, as JSON
+  wifi on|off|status           allow or block Wi-Fi connections and scanning
   disconnect <id|unit>         stop a session
   restart <id|unit>            restart a session
   autoconnect <id> on|off      turn auto-connect on or off
@@ -556,7 +719,7 @@ Commands
 
 Internal (used by the widget and tests)
   last-error <unit>  first-lines <unit>  notify <key> <body>
-  doctor-run  details-run  unit-names <id>  addr-unit <host:port>
+  doctor-run  details-run  unit-names <id>  addr-unit <host:port>  usb-unit <id>
 
 Exit codes
   0   success
@@ -569,6 +732,9 @@ Exit codes
   9   install/update refused: an od-sender started outside the plugin is running
   10  install/update refused: od-sender is managed by pacman
   11  couldn't reach GitHub
+  12  connect refused: Wi-Fi connections are turned off
+  13  USB needs usbmuxd, which isn't running or installed
+  14  the receiver isn't connected by USB (or its app isn't open)
 EOF
 }
 
@@ -576,11 +742,14 @@ main() {
   local cmd="${1-}"
   shift || true
   case "$cmd" in
-    connect|connect-addr|disconnect|restart|autoconnect|config-set) trap stamp_change EXIT ;;
+    connect|connect-addr|connect-usb|disconnect|restart|autoconnect|config-set|wifi) trap stamp_change EXIT ;;
   esac
   case "$cmd" in
     connect) cmd_connect "$@" ;;
     connect-addr) cmd_connect_addr "$@" ;;
+    connect-usb) cmd_connect_usb "$@" ;;
+    usb-list) cmd_usb_list ;;
+    wifi) cmd_wifi "$@" ;;
     disconnect) cmd_disconnect "$@" ;;
     restart) cmd_restart "$@" ;;
     autoconnect) cmd_autoconnect "$@" ;;
@@ -604,6 +773,7 @@ main() {
     details) launch_terminal "$HERE/omarchy-opendisplay" details-run ;;
     details-run) cmd_details_run ;;
     unit-names) need_id "${1-}"; transient_unit "$1"; echo; template_unit "$1"; echo; output_for_id "$1"; echo ;;
+    usb-unit) need_id "${1-}"; usb_unit "$1"; echo ;;
     addr-unit) valid_addr "${1-}" || die_code 2 "invalid address"; addr_unit "$1"; echo ;;
     -h|--help|help|"") usage ;;
     *) usage >&2; exit 2 ;;
