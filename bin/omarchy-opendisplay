@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+# omarchy-opendisplay: helper for the OpenDisplay Omarchy bar widget.
+#
+# Drives the official od-sender CLI; never reimplements the protocol. Sessions
+# run as systemd user units so they outlive shell restarts:
+#   manual connect   opendisplay-<id8>.service        (transient, systemd-run)
+#   connect by IP    opendisplay-addr-<sha1-8>.service (transient)
+#   auto-connect     od-sender@<escaped id>.service   (upstream template unit)
+#
+# Every value from outside is validated before use and always passed as a
+# separate argument; nothing is ever evaluated as shell code.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PY=(python3 -I)
+UTIL="$HERE/opendisplay-util.py"
+CONFIG_TOOL="$HERE/sender-config.py"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-opendisplay"
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+LOCKS="$RUNTIME/opendisplay"
+STATE="$RUNTIME/omarchy-opendisplay"
+RELEASE_API="https://api.github.com/repos/peetzweg/opendisplay/releases/latest"
+CURL=(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --max-time 60)
+
+ID_RE='^[0-9A-Fa-f][0-9A-Fa-f-]{7,63}$'
+ADDR_RE='^[[A-Za-z0-9][]A-Za-z0-9.:[-]{0,79}:([0-9]{1,5})$'
+UNIT_RE='^(opendisplay-[0-9a-f]{8}|opendisplay-addr-[0-9a-f]{8}|od-sender@[A-Za-z0-9\\_.:-]{1,300})\.service$'
+
+export NO_COLOR=1
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+valid_id() { [[ ${1-} =~ $ID_RE ]]; }
+
+valid_addr() {
+  [[ ${1-} =~ $ADDR_RE ]] || return 1
+  local port=$((10#${BASH_REMATCH[1]}))
+  (( port >= 1 && port <= 65535 ))
+}
+
+valid_unit() { [[ ${1-} =~ $UNIT_RE ]]; }
+
+need_id() { valid_id "${1-}" || die "invalid receiver id"; }
+
+# --- unit names: the only places these are built ----------------------------
+
+transient_unit() {  # <id>
+  local hex="${1//-/}"
+  hex="${hex,,}"
+  printf 'opendisplay-%s.service' "${hex:0:8}"
+}
+
+addr_unit() {  # <host:port>
+  local sum
+  sum="$(printf '%s' "$1" | sha1sum)"
+  printf 'opendisplay-addr-%s.service' "${sum:0:8}"
+}
+
+template_unit() {  # <id>
+  printf 'od-sender@%s.service' "$(systemd-escape -- "$1")"
+}
+
+output_for_id() {  # <id>
+  local hex="${1//-/}"
+  hex="${hex,,}"
+  printf 'od-%s' "${hex:0:6}"
+}
+
+# --- od-sender --------------------------------------------------------------
+
+find_sender() {
+  local p
+  if p="$(command -v od-sender 2>/dev/null)" && [[ -x $p ]]; then
+    printf '%s' "$p"
+  elif [[ -x $HOME/.local/bin/od-sender ]]; then
+    printf '%s' "$HOME/.local/bin/od-sender"
+  else
+    return 1
+  fi
+}
+
+require_sender() {
+  SENDER="$(find_sender)" || die "od-sender is not installed"
+}
+
+sender_version() {  # <path>
+  local out
+  out="$(timeout 10 "$1" --version 2>/dev/null)" || return 1
+  [[ $out =~ ^od-sender\ ([0-9]+\.[0-9]+\.[0-9]+) ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]}"
+}
+
+unit_state() { systemctl --user show -p ActiveState --value -- "$1" 2>/dev/null; }
+
+unit_active() {
+  case "$(unit_state "$1")" in active|activating|reloading) return 0 ;; esac
+  return 1
+}
+
+# PID of a live sender for an output, from its lock file. The lock file stays
+# behind after the sender exits, so the PID must be alive and be od-sender.
+lock_pid() {  # <output>
+  local lock="$LOCKS/$1.lock" pid comm
+  [[ -r $lock ]] || return 1
+  read -r pid < "$lock" || return 1
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  comm="$(cat "/proc/$pid/comm" 2>/dev/null)" || return 1
+  [[ $comm == od-sender ]] || return 1
+  printf '%s' "$pid"
+}
+
+json_field() {  # <json> <field>
+  "${PY[@]}" -c 'import json,sys
+v = json.loads(sys.argv[1]).get(sys.argv[2])
+print("" if v is None else (str(v).lower() if isinstance(v, bool) else v))' "$1" "$2"
+}
+
+# --- sessions ---------------------------------------------------------------
+
+start_transient() {  # <unit> <to>
+  local unit="$1" to="$2"
+  case "$(unit_state "$unit")" in
+    active|activating) echo "already connected"; return 0 ;;
+    failed) systemctl --user reset-failed -- "$unit" 2>/dev/null ;;
+  esac
+  systemd-run --user --quiet --unit="$unit" --description="OpenDisplay to $to" \
+    --setenv=NO_COLOR=1 --property=Restart=no -- "$SENDER" run --to="$to" || return 1
+  echo "$unit"
+}
+
+cmd_connect() {
+  need_id "${1-}"
+  local id="$1"
+  require_sender
+  if unit_active "$(template_unit "$id")"; then echo "already connected (auto-connect)"; return 0; fi
+  if lock_pid "$(output_for_id "$id")" >/dev/null; then echo "already connected"; return 0; fi
+  start_transient "$(transient_unit "$id")" "$id"
+}
+
+cmd_connect_addr() {
+  valid_addr "${1-}" || die "invalid address; use host:port"
+  require_sender
+  start_transient "$(addr_unit "$1")" "$1"
+}
+
+stop_units() {
+  local u
+  for u in "$@"; do
+    systemctl --user stop -- "$u" 2>/dev/null
+    [[ $(unit_state "$u") == failed ]] && systemctl --user reset-failed -- "$u" 2>/dev/null
+  done
+  return 0
+}
+
+wait_gone() {  # <output> <seconds>
+  local i
+  for ((i = 0; i < $2 * 10; i++)); do
+    lock_pid "$1" >/dev/null || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+cmd_disconnect() {
+  local target="${1-}" output pid
+  if valid_unit "$target"; then
+    stop_units "$target"
+    return 0
+  fi
+  if [[ $target =~ ^od-[0-9a-f]{6}$ ]]; then
+    output="$target"  # an external sender whose receiver id isn't known
+  else
+    need_id "$target"
+    stop_units "$(transient_unit "$target")" "$(template_unit "$target")"
+    output="$(output_for_id "$target")"
+  fi
+  wait_gone "$output" 3 && return 0
+  # A sender started outside the plugin (or stuck, see upstream bug 1).
+  pid="$(lock_pid "$output")" || return 0
+  kill -INT "$pid" 2>/dev/null
+  wait_gone "$output" 3 && return 0
+  pid="$(lock_pid "$output")" || return 0
+  kill -TERM "$pid" 2>/dev/null
+  wait_gone "$output" 2 || die "od-sender (pid $pid) didn't stop"
+}
+
+cmd_restart() {
+  local target="${1-}" u
+  if valid_unit "$target"; then
+    systemctl --user restart -- "$target"
+    return
+  fi
+  need_id "$target"
+  for u in "$(template_unit "$target")" "$(transient_unit "$target")"; do
+    if unit_active "$u"; then systemctl --user restart -- "$u"; return; fi
+  done
+  if lock_pid "$(output_for_id "$target")" >/dev/null; then
+    cmd_disconnect "$target" && cmd_connect "$target"
+  fi
+}
+
+cmd_autoconnect() {
+  need_id "${1-}"
+  local id="$1" mode="${2-}" tpl transient
+  tpl="$(template_unit "$id")"
+  transient="$(transient_unit "$id")"
+  case "$mode" in
+    on)
+      "${PY[@]}" "$UTIL" status | grep -q '"templateInstalled": true' \
+        || die "Auto-connect needs the od-sender systemd unit"
+      # Two senders for one receiver would fight; the template takes over.
+      unit_active "$transient" && stop_units "$transient"
+      systemctl --user enable --now -- "$tpl"
+      ;;
+    off)
+      local was_active=0
+      unit_active "$tpl" && was_active=1
+      systemctl --user disable --now -- "$tpl" 2>/dev/null
+      [[ $(unit_state "$tpl") == failed ]] && systemctl --user reset-failed -- "$tpl" 2>/dev/null
+      # Turning auto-connect off shouldn't drop a display that's in use.
+      if (( was_active )) && [[ ${3-} != --no-reconnect ]]; then cmd_connect "$id"; fi
+      return 0
+      ;;
+    *) die "usage: autoconnect <id> on|off" ;;
+  esac
+}
+
+cmd_logs() {
+  valid_unit "${1-}" || die "invalid unit"
+  local since
+  since="$(systemctl --user show -p InactiveExitTimestamp --timestamp=unix --value -- "$1" 2>/dev/null)"
+  if [[ $since =~ ^@[0-9]+$ ]]; then
+    # Replay the current run only (never an earlier one), capped.
+    exec journalctl --user -u "$1" -o cat -f -n 200 --since="$since"
+  fi
+  exec journalctl --user -u "$1" -o cat -f -n 0
+}
+
+cmd_list() {
+  require_sender
+  exec timeout 15 "$SENDER" list --json --timeout 3
+}
+
+# The last ERROR line of a unit's most recent run, for a connect that failed
+# before the log tail saw it.
+cmd_last_error() {
+  valid_unit "${1-}" || die "invalid unit"
+  local since args=(--user -u "$1" -o cat -n 200 --no-pager)
+  since="$(systemctl --user show -p InactiveExitTimestamp --timestamp=unix --value -- "$1" 2>/dev/null)"
+  [[ $since =~ ^@[0-9]+$ ]] && args+=(--since="$since")
+  journalctl "${args[@]}" 2>/dev/null | grep ' ERROR ' | tail -n1 | cut -c1-4096
+}
+
+# The connected/hello/Extending lines of a unit's current run, so a session
+# that started long ago still has its receiver's name and address.
+cmd_first_lines() {
+  valid_unit "${1-}" || die "invalid unit"
+  local since
+  since="$(systemctl --user show -p InactiveExitTimestamp --timestamp=unix --value -- "$1" 2>/dev/null)"
+  [[ $since =~ ^@[0-9]+$ ]] || return 0
+  journalctl --user -u "$1" -o cat --no-pager --since="$since" 2>/dev/null \
+    | grep -m3 -E '^[0-9TZ:.-]+ +INFO (connected to receiver|hello:|Extending onto)' | cut -c1-4096
+  return 0
+}
+
+# --- install / update -------------------------------------------------------
+
+cmd_version() {
+  local path ver managed=other
+  if ! path="$(find_sender)" || ! ver="$(sender_version "$path")"; then
+    echo '{"installed": false}'
+    return 0
+  fi
+  if [[ $path == "$HOME/.local/bin/"* ]]; then
+    managed=user
+  elif command -v pacman >/dev/null && pacman -Qqo -- "$path" >/dev/null 2>&1; then
+    managed=package
+  fi
+  "${PY[@]}" -c 'import json,sys; print(json.dumps({"installed": True, "version": sys.argv[1], "path": sys.argv[2], "managed": sys.argv[3]}))' \
+    "$ver" "$path" "$managed"
+}
+
+arch_name() {
+  case "$(uname -m)" in
+    x86_64) echo x86_64 ;;
+    aarch64|arm64) echo aarch64 ;;
+    *) return 1 ;;
+  esac
+}
+
+fetch_release() {  # prints the path of a release JSON file
+  mkdir -p "$CACHE"
+  if [[ -n ${OMARCHY_OPENDISPLAY_RELEASE_FILE-} ]]; then  # tests / manual acceptance
+    printf '%s' "$OMARCHY_OPENDISPLAY_RELEASE_FILE"
+    return 0
+  fi
+  local cached="$CACHE/release.json" etag="$CACHE/release.etag" tmp code
+  tmp="$(mktemp "$CACHE/release.XXXXXX")"
+  local args=("${CURL[@]}" --max-filesize 1M -H 'Accept: application/vnd.github+json' -o "$tmp" -w '%{http_code}' --etag-save "$etag.new")
+  [[ -s $cached && -s $etag ]] && args+=(--etag-compare "$etag")
+  if ! code="$("${args[@]}" "$RELEASE_API")"; then
+    rm -f "$tmp" "$etag.new"
+    die "Couldn't reach GitHub"
+  fi
+  if [[ $code == 304 ]]; then
+    rm -f "$tmp" "$etag.new"
+  else
+    mv -f "$tmp" "$cached"
+    if [[ -s $etag.new ]]; then mv -f "$etag.new" "$etag"; else rm -f "$etag.new"; fi
+  fi
+  printf '%s' "$cached"
+}
+
+cmd_check_update() {
+  local arch file installed=""
+  arch="$(arch_name)" || die "unsupported architecture: $(uname -m)"
+  file="$(fetch_release)" || exit 1
+  local path
+  path="$(find_sender)" && installed="$(sender_version "$path")"
+  "${PY[@]}" "$UTIL" release "$file" "$arch" "${installed:-none}"
+}
+
+download() {  # <url> <dest>
+  if [[ -n ${OMARCHY_OPENDISPLAY_DOWNLOAD_DIR-} ]]; then  # tests only
+    cp -- "$OMARCHY_OPENDISPLAY_DOWNLOAD_DIR/${1##*/}" "$2"
+    return
+  fi
+  "${CURL[@]}" --max-filesize 50M -o "$2" "$1"
+}
+
+cmd_install() {
+  (( EUID != 0 )) || die "Run as your user, not root"
+  mkdir -p "$CACHE"
+  local log="$CACHE/last-update.log"
+  # Everything below is also kept for the "Details" view.
+  exec > >(tee "$log") 2>&1
+
+  local vinfo
+  vinfo="$(cmd_version)"
+  if [[ $(json_field "$vinfo" managed) == package ]]; then
+    die "od-sender is installed by pacman; update it with your package manager"
+  fi
+
+  local arch info url digest sha_url latest
+  arch="$(arch_name)" || die "unsupported architecture: $(uname -m)"
+  info="$(cmd_check_update)" || exit 1
+  url="$(json_field "$info" url)"
+  digest="$(json_field "$info" digest)"
+  sha_url="$(json_field "$info" sha256Url)"
+  latest="$(json_field "$info" latest)"
+  [[ -n $url ]] || die "the release has no od-sender build for $arch"
+  [[ -n $sha_url && -n $digest ]] || die "the release has no checksum for od-sender; not installing"
+
+  local top="od-sender-$arch-unknown-linux-gnu"
+  INSTALL_TMP="$(mktemp -d "$CACHE/install.XXXXXX")"
+  trap 'rm -rf -- "$INSTALL_TMP"' EXIT
+  local tmp="$INSTALL_TMP"
+  echo "Downloading od-sender $latest"
+  download "$url" "$tmp/od-sender.tar.gz" || die "download failed"
+  download "$sha_url" "$tmp/od-sender.tar.gz.sha256" || die "checksum download failed"
+  "${PY[@]}" "$UTIL" verify-sha "$tmp/od-sender.tar.gz" "$tmp/od-sender.tar.gz.sha256" "$digest" || exit 1
+  echo "Checksum verified (sha256 matches the release file and GitHub's digest)"
+  "${PY[@]}" "$UTIL" check-tar "$tmp/od-sender.tar.gz" "$top" || exit 1
+  mkdir "$tmp/x"
+  tar -xzf "$tmp/od-sender.tar.gz" -C "$tmp/x" --no-same-owner --no-same-permissions || die "couldn't unpack the archive"
+  [[ -f $tmp/x/$top/install.sh && -f $tmp/x/$top/od-sender ]] || die "unexpected archive layout"
+
+  # Stop what's running, remembering it so it comes back afterwards.
+  local status
+  status="$("${PY[@]}" "$UTIL" status)"
+  local plan
+  plan="$("${PY[@]}" -c '
+import json, sys
+s = json.loads(sys.argv[1])
+if any(x.get("unit") is None for x in s["sessions"]):
+    print("EXTERNAL"); sys.exit()
+for u in s["units"]:
+    if u["state"] not in ("active", "activating"):
+        continue
+    kind = "template" if u["template"] else ("addr" if u["unit"].startswith("opendisplay-addr-") else "id")
+    print(kind, u["unit"], u["to"])
+' "$status")"
+  if [[ $plan == EXTERNAL* ]]; then
+    die "Stop the od-sender running in your terminal first"
+  fi
+  local kind unit to
+  while read -r kind unit to; do
+    [[ -n ${unit-} ]] && valid_unit "$unit" && stop_units "$unit"
+  done <<< "$plan"
+
+  echo "Running the official install.sh"
+  ( cd "$tmp/x/$top" && bash ./install.sh ) || die "install.sh failed"
+
+  SENDER="$(find_sender)" || die "od-sender isn't on PATH after installing"
+  while read -r kind unit to; do
+    [[ -n ${unit-} ]] || continue
+    case "$kind" in
+      template) valid_unit "$unit" && systemctl --user start -- "$unit" ;;
+      id) valid_id "$to" && start_transient "$(transient_unit "$to")" "$to" ;;
+      addr) valid_addr "$to" && start_transient "$(addr_unit "$to")" "$to" ;;
+    esac
+  done <<< "$plan"
+
+  local now
+  now="$(sender_version "$SENDER")" || die "od-sender doesn't run after installing"
+  [[ $now == "$latest" ]] || die "expected od-sender $latest, found $now"
+  echo "Installed od-sender $now"
+}
+
+# --- sender.toml ------------------------------------------------------------
+
+doctor_code() {
+  local s
+  s="$(find_sender)" || { echo 1; return; }
+  timeout 20 "$s" doctor >/dev/null 2>&1
+  echo $?
+}
+
+cmd_config_set() {
+  mkdir -p "$STATE"
+  exec 9> "$STATE/config.lock"
+  flock -w 15 9 || die "sender.toml is busy"
+  local before after
+  before="$(doctor_code)"
+  "${PY[@]}" "$CONFIG_TOOL" set "$@" || exit 1
+  after="$(doctor_code)"
+  if [[ $before == 0 && $after == 2 ]]; then
+    "${PY[@]}" "$CONFIG_TOOL" rollback
+    die "od-sender rejected the setting"
+  fi
+  if [[ $after != 0 ]]; then
+    echo "od-sender can't run here" >&2
+    exit 5  # saved, but doctor isn't happy
+  fi
+}
+
+# --- notifications ----------------------------------------------------------
+
+# Every bar (one per monitor) runs its own copy of the widget, so the same
+# event can be reported more than once; send each <key> at most once a minute.
+# The body is already markup-escaped by the caller and passed as one argument.
+cmd_notify() {
+  local key="${1-}" body="${2-}"
+  [[ $key =~ ^[A-Za-z0-9._:@-]{1,200}$ ]] || die "invalid notification key"
+  mkdir -p "$STATE"
+  exec 8> "$STATE/notify.lock"
+  flock -w 5 8 || return 0
+  local stamp
+  stamp="$STATE/notified-$(printf '%s' "$key" | sha1sum | cut -c1-16)"
+  if [[ -e $stamp ]] && (( $(date +%s) - $(stat -c %Y "$stamp") < 60 )); then return 0; fi
+  touch "$stamp"
+  notify-send -a OpenDisplay -- OpenDisplay "${body:0:300}"
+}
+
+# --- terminals --------------------------------------------------------------
+
+launch_terminal() {
+  if command -v uwsm-app >/dev/null; then
+    setsid uwsm-app -- xdg-terminal-exec --app-id=org.omarchy.terminal --title=OpenDisplay -e "$@" >/dev/null 2>&1 &
+  else
+    setsid xdg-terminal-exec -e "$@" >/dev/null 2>&1 &
+  fi
+  disown
+}
+
+press_any_key() { echo; read -rsn1 -p 'Press any key to close' || true; }
+
+cmd_doctor_run() {
+  if require_sender_quiet; then "$SENDER" doctor; echo "(exit $?)"; else echo "od-sender is not installed"; fi
+  press_any_key
+}
+
+require_sender_quiet() { SENDER="$(find_sender)"; }
+
+cmd_details_run() {
+  if [[ -r $CACHE/last-update.log ]]; then cat -v -- "$CACHE/last-update.log"; else echo "No update log yet."; fi
+  press_any_key
+}
+
+usage() {
+  cat <<'EOF'
+usage: omarchy-opendisplay <command> [args]
+  connect <id> | connect-addr <host:port> | disconnect <id|unit> | restart <id|unit>
+  autoconnect <id> on|off | status --json | logs <unit> | last-error <unit> | list
+  version | check-update | install | update
+  config-get | config-set [--receiver <id>] key=value...
+  doctor | details
+EOF
+}
+
+main() {
+  local cmd="${1-}"
+  shift || true
+  case "$cmd" in
+    connect) cmd_connect "$@" ;;
+    connect-addr) cmd_connect_addr "$@" ;;
+    disconnect) cmd_disconnect "$@" ;;
+    restart) cmd_restart "$@" ;;
+    autoconnect) cmd_autoconnect "$@" ;;
+    status) exec "${PY[@]}" "$UTIL" status ;;
+    logs) cmd_logs "$@" ;;
+    list) cmd_list ;;
+    last-error) cmd_last_error "$@" ;;
+    first-lines) cmd_first_lines "$@" ;;
+    notify) cmd_notify "$@" ;;
+    version) cmd_version ;;
+    check-update) cmd_check_update ;;
+    install|update) cmd_install ;;
+    config-get) exec "${PY[@]}" "$CONFIG_TOOL" get --json ;;
+    config-set) cmd_config_set "$@" ;;
+    doctor) launch_terminal "$HERE/omarchy-opendisplay" doctor-run ;;
+    doctor-run) cmd_doctor_run ;;
+    details) launch_terminal "$HERE/omarchy-opendisplay" details-run ;;
+    details-run) cmd_details_run ;;
+    unit-names) need_id "${1-}"; transient_unit "$1"; echo; template_unit "$1"; echo; output_for_id "$1"; echo ;;
+    addr-unit) valid_addr "${1-}" || die "invalid address"; addr_unit "$1"; echo ;;
+    -h|--help|help|"") usage ;;
+    *) usage >&2; exit 1 ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.muneebabbas.opendisplay",
+  "name": "OpenDisplay",
+  "version": "0.1.0",
+  "author": "Muneeb Abbas",
+  "license": "MIT",
+  "description": "Extend your Omarchy desktop onto an iPad, phone or Mac with the official OpenDisplay sender (od-sender): discover receivers, connect in one click, pick a quality, and keep od-sender up to date.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "OpenDisplay",
+    "description": "Left-click for receivers and quality; right-click to connect the last receiver or disconnect; middle-click to rescan.",
+    "category": "Display",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "checkUpdates": true, "showNameInBar": true },
+    "schema": [
+      { "key": "checkUpdates", "type": "boolean", "label": "Check GitHub daily for od-sender updates", "defaultValue": true },
+      { "key": "showNameInBar", "type": "boolean", "label": "Show the connected receiver's name in the bar", "defaultValue": true }
+    ]
+  }
+}
