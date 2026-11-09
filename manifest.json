@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.muneebabbas.opendisplay",
   "name": "OpenDisplay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Muneeb Abbas",
   "license": "MIT",
-  "description": "Extend your Omarchy desktop onto an iPad, phone or Mac with the official OpenDisplay sender (od-sender): discover receivers, connect in one click, pick a quality, and keep od-sender up to date.",
+  "description": "Extend your Omarchy desktop onto an iPad, phone or Mac with the official OpenDisplay sender (od-sender), over Wi-Fi or USB: discover receivers, connect in one click, pick a quality, and keep od-sender up to date.",
   "kinds": ["bar-widget"],
   "entryPoints": { "barWidget": "Panel.qml" },
   "barWidget": {

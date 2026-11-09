@@ -758,8 +758,19 @@ Panel {
 
             Text {
               textFormat: Text.PlainText
+              visible: od.scanned
               width: parent.width
-              text: !od.wifiEnabled ? strings.t("empty.usbOnly") : (od.scanned ? strings.t("empty.text") : strings.t("empty.scanning"))
+              text: strings.t("empty.title")
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: !od.scanned ? strings.t("empty.scanning") : (od.wifiEnabled ? strings.t("empty.text") : strings.t("empty.usbOnly"))
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -845,15 +856,26 @@ Panel {
           }
 
           // --- USB hint (usbmuxd not installed)
-          Text {
-            textFormat: Text.PlainText
+          Column {
             visible: root.showUsbHint
             width: parent.width
-            text: strings.t("hint.usbmuxd")
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
+            spacing: Style.space(6)
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              text: od.usbmuxdInstallStarted ? strings.t("hint.usbmuxdReplug") : strings.t("hint.usbmuxd")
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            LinkText {
+              visible: !od.usbmuxdInstallStarted
+              text: strings.t("hint.usbmuxdInstall")
+              onClicked: od.installUsbmuxd()
+            }
           }
 
           // --- footer

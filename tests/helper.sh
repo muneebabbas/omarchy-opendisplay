@@ -37,6 +37,12 @@ case "$1" in
       code="$(head -n1 "$FAKE/doctor")"; sed -i 1d "$FAKE/doctor"; exit "$code"
     fi
     exit 0 ;;
+  list)
+    case "${FAKE_LIST:-}" in
+      empty) echo '[]'; exit 1 ;;           # od-sender's "nothing found"
+      error) echo "network unreachable" >&2; exit 1 ;;
+      *) echo "fake od-sender $*"; exit 0 ;;
+    esac ;;
   *) echo "fake od-sender $*"; exit 0 ;;
 esac
 EOF
@@ -325,6 +331,20 @@ check "the cache lives in the runtime dir" [ -s "$XDG_RUNTIME_DIR/omarchy-opendi
 check "usbmuxd shows as running in status" bash -c '[[ $("$0" status) == *"\"usb\": \"running\""* ]]' "$HELPER"
 check "connect-usb for a receiver not on USB exits 14" [ "$(code_of "$HELPER" connect-usb "BEEF0000-0000-0000-0000-000000000001")" = 14 ]
 check "usb-list leaves no temp files beside the cache" bash -c '! ls "$0"/.usb-cache.* 2>/dev/null' "$XDG_RUNTIME_DIR/omarchy-opendisplay"
+# install-usbmuxd execs Omarchy's installer with separate args.
+cat > "$T/bin/omarchy-install-app" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$FAKE/install-app-args"
+EOF
+chmod +x "$T/bin/omarchy-install-app"
+"$HELPER" install-usbmuxd
+check "install-usbmuxd runs omarchy-install-app usbmuxd usbmuxd" [ "$(tr '\n' ' ' < "$FAKE/install-app-args")" = "usbmuxd usbmuxd " ]
+rm -f "$T/bin/omarchy-install-app"
+# A PATH holding only what the helper needs at startup (the real
+# omarchy-install-app may live in /usr/bin).
+mkdir -p "$T/nobin"
+for c in readlink dirname; do ln -sf "$(command -v "$c")" "$T/nobin/$c"; done
+check "install-usbmuxd without omarchy-install-app fails with a hint" bash -c '[[ $(PATH="$1" "$BASH" "$0" install-usbmuxd 2>&1) == *"omarchy pkg add usbmuxd"* ]]' "$HELPER" "$T/nobin"
 BEEF_TPL='od-sender@BEEF0000\x2d0000\x2d0000\x2d0000\x2d000000000001.service'
 reset_fake
 set_unit "$BEEF_TPL" active
@@ -461,6 +481,8 @@ XDG_CONFIG_HOME="$T/odd\$cfg%" "$HELPER" wifi off >/dev/null
 check "the drop-in escapes \$ and % in the flag path" grep -qF 'ExecCondition=test ! -e "'"$T"'/odd$$cfg%%/omarchy-opendisplay/wifi-disabled"' "$T/odd\$cfg%/systemd/user/od-sender@.service.d/omarchy-opendisplay-wifi.conf"
 XDG_CONFIG_HOME="$T/odd\$cfg%" "$HELPER" wifi on >/dev/null
 check "list scans again with Wi-Fi on" contains "$("$HELPER" list)" "fake od-sender list"
+check "list treats od-sender's empty result (exit 1, []) as success" bash -c '[ "$(FAKE_LIST=empty "$0" list)" = "[]" ]' "$HELPER"
+check "list still fails when od-sender errors" bash -c '! FAKE_LIST=error "$0" list >/dev/null 2>&1' "$HELPER"
 rm -f "$XDG_CONFIG_HOME/systemd/user/default.target.wants/$TEMPLATE"
 rmdir "$XDG_CONFIG_HOME/systemd/user/default.target.wants" 2>/dev/null
 reset_fake

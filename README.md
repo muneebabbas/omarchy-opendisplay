@@ -1,6 +1,6 @@
 # OpenDisplay for Omarchy
 
-An Omarchy bar widget around the official [OpenDisplay](https://github.com/peetzweg/opendisplay) Linux sender, `od-sender`. Extend your desktop onto an iPad, iPhone, Android device or Mac: discover receivers, connect in one click, pick a quality preset, and keep `od-sender` installed and up to date from its GitHub releases.
+An Omarchy bar widget around the official [OpenDisplay](https://github.com/peetzweg/opendisplay) Linux sender, `od-sender`. Extend your desktop onto an iPad, iPhone, Android device or Mac, over Wi-Fi or USB (iPad and iPhone): discover receivers, connect in one click, pick a quality preset, and keep `od-sender` installed and up to date from its GitHub releases.
 
 It does not reimplement the OpenDisplay protocol. Everything goes through the `od-sender` CLI.
 
@@ -32,7 +32,7 @@ Each connected receiver's card shows how it's connected (**USB**, **Wi-Fi** or *
 
 An iPad or iPhone plugged in by cable can be used over USB instead of Wi-Fi. od-sender has no USB transport on Linux, so the plugin adds one: `bin/usbmux.py` asks [usbmuxd](https://github.com/libimobiledevice/usbmuxd) for a tunnel to the OpenDisplay app's port (TCP 9000) on the device and forwards a loopback port to it, and od-sender connects to that port (`od-sender run --to=127.0.0.1:<port>`). The receiver reports the session as USB.
 
-- **Needs usbmuxd:** `sudo pacman -S usbmuxd`. It starts by itself when an Apple device is plugged in. Without usbmuxd, the panel shows a short hint when Wi-Fi connections are off or no receivers are found, and Doctor reports it.
+- **Needs usbmuxd:** `omarchy pkg add usbmuxd`. It starts by itself when an Apple device is plugged in. Without usbmuxd, the panel shows a short hint when Wi-Fi connections are off or no receivers are found, and Doctor reports it.
 - A receiver that's plugged in shows a small **USB** tag in its row, and **Connect** (and right-click "connect last") use USB for it.
 - Unplugging the device ends the session.
 - Auto-connect stays Wi-Fi only: there's no USB auto-connect yet. Connecting a receiver by USB stops its waiting auto-connect sender for now (it stays enabled and starts again at the next login), so the two don't fight over the receiver.
@@ -89,9 +89,10 @@ omarchy-shell io.github.muneebabbas.opendisplay wifi off             # on | off 
 | `kill -INT` / `kill -TERM` on an `od-sender` PID from its lock file | Disconnecting a sender you started outside the panel |
 | `python3 -I bin/sender-config.py`, `python3 -I bin/opendisplay-util.py` | Reading and editing `sender.toml`; status, release and archive checks (stdlib only) |
 | `curl`, `sha256sum`, `tar`, then the release's own `install.sh` | Only when you click Install or Update |
+| `omarchy-install-app usbmuxd usbmuxd` | When you click Install usbmuxd |
 | `notify-send`, `xdg-terminal-exec`, `omarchy-launch-browser`, `pacman -Qo` | Notifications, the Doctor and Details terminals, the release page, detecting a pacman-installed od-sender |
 
-No `sudo` or `pkexec`, ever.
+No `sudo` or `pkexec`, ever. The plugin never runs sudo itself; Omarchy's installer asks for your password in a terminal you can see.
 
 Over USB, `bin/usbmux.py` reads the receiver's first message (its hello: id, device name, protocol version) on a connection it then closes without sending anything, to learn which receiver is on which device. It does this once per plug-in.
 

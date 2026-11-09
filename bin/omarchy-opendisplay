@@ -217,7 +217,7 @@ start_usb() {  # <id>
   udid="$("${PY[@]}" "$USBMUX" find "$id")" || rc=$?
   case "$rc" in
     0) ;;
-    13) echo "USB needs usbmuxd: sudo pacman -S usbmuxd" >&2; return 13 ;;
+    13) echo "USB needs usbmuxd: omarchy pkg add usbmuxd" >&2; return 13 ;;
     14) echo "receiver isn't connected by USB" >&2; return 14 ;;
     *) echo "couldn't look for USB devices" >&2; return 1 ;;
   esac
@@ -364,7 +364,13 @@ cmd_list() {
   # No network scanning at all while Wi-Fi connections are off.
   if ! wifi_enabled; then echo '[]'; return 0; fi
   require_sender
-  exec timeout 15 "$SENDER" list --json --timeout 3
+  # `od-sender list --json` exits 1 with `[]` when it finds nothing; that is
+  # an empty result, not a failed scan. Real errors print no JSON array.
+  local out rc=0
+  out="$(timeout 15 "$SENDER" list --json --timeout 3)" || rc=$?
+  if (( rc == 1 )) && [[ $(tr -d '[:space:]' <<<"$out") == "[]" ]]; then rc=0; fi
+  printf '%s\n' "$out"
+  return "$rc"
 }
 
 # Quotes a path for a systemd unit file: "..." with \, " and % escaped.
@@ -674,6 +680,12 @@ launch_terminal() {
 
 press_any_key() { echo; read -rsn1 -p 'Press any key to close' || true; }
 
+cmd_install_usbmuxd() {
+  command -v omarchy-install-app >/dev/null 2>&1 \
+    || die "omarchy-install-app not found; run: omarchy pkg add usbmuxd"
+  exec omarchy-install-app usbmuxd usbmuxd
+}
+
 cmd_doctor_run() {
   if require_sender_quiet; then "$SENDER" doctor; echo "(exit $?)"; else echo "od-sender is not installed"; fi
   echo
@@ -681,7 +693,7 @@ cmd_doctor_run() {
   case "$("${PY[@]}" "$USBMUX" state 2>/dev/null)" in
     running) echo "USB: usbmuxd is running"; "${PY[@]}" "$USBMUX" list 2>/dev/null ;;
     installed) echo "USB: usbmuxd is installed (it starts when an iPhone or iPad is plugged in)" ;;
-    *) echo "USB needs usbmuxd: sudo pacman -S usbmuxd" ;;
+    *) echo "USB needs usbmuxd: omarchy pkg add usbmuxd" ;;
   esac
   press_any_key
 }
@@ -716,6 +728,7 @@ Commands
   config-set [--receiver <id>] key=value...
   doctor                       run od-sender doctor in a terminal
   details                      show the last install log in a terminal
+  install-usbmuxd              install usbmuxd in an Omarchy floating terminal
 
 Internal (used by the widget and tests)
   last-error <unit>  first-lines <unit>  notify <key> <body>
@@ -770,6 +783,7 @@ main() {
     config-set) cmd_config_set "$@" ;;
     doctor) launch_terminal "$HERE/omarchy-opendisplay" doctor-run ;;
     doctor-run) cmd_doctor_run ;;
+    install-usbmuxd) cmd_install_usbmuxd ;;
     details) launch_terminal "$HERE/omarchy-opendisplay" details-run ;;
     details-run) cmd_details_run ;;
     unit-names) need_id "${1-}"; transient_unit "$1"; echo; template_unit "$1"; echo; output_for_id "$1"; echo ;;
