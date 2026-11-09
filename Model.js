@@ -163,11 +163,11 @@ function linkLabel(via, live) {
   return t !== "" ? t : "Wi-Fi"
 }
 
-// What a finished `list` means for the error line: a failure sets
-// error.scanFailed; a success clears only that error, never another one.
+// What a finished `list` means for the error line. A scan that finds nothing or fails just means nothing is available: the
+// empty state says so (with Doctor for real trouble), so no error banner.
+// A leftover error.scanFailed (from older versions) is cleared either way.
 function scanErrorAction(ok, installed, errorKey) {
-  if (ok) return errorKey === "error.scanFailed" ? "clear" : "keep"
-  return installed ? "set" : "keep"
+  return errorKey === "error.scanFailed" ? "clear" : "keep"
 }
 
 function isLoopbackAddr(addr) {

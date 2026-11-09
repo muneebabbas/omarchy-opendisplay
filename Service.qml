@@ -565,6 +565,12 @@ Item {
   }
 
   function openDoctor() { Quickshell.execDetached([helperPath, "doctor"]) }
+  // Set once the installer has been launched; the panel then asks for a replug.
+  property bool usbmuxdInstallStarted: false
+  function installUsbmuxd() {
+    usbmuxdInstallStarted = true
+    Quickshell.execDetached([helperPath, "install-usbmuxd"])
+  }
   function openDetails() { Quickshell.execDetached([helperPath, "details"]) }
   function openRelease() {
     var url = Model.isGithubUrl(htmlUrl) ? htmlUrl : "https://github.com/peetzweg/opendisplay/releases/latest"
@@ -762,10 +768,9 @@ Item {
       var ok = code === 0 && r.ok
       var action = Model.scanErrorAction(ok, root.installed, root.errorKey)
       if (action === "clear") root.clearError()
-      else if (action === "set") root.setError("error.scanFailed")
-      if (!ok) return
-      // Wi-Fi may have been turned off while this scan ran.
-      var items = root.wifiEnabled ? r.items : []
+      // Wi-Fi may have been turned off while this scan ran; a failed scan
+      // shows nothing rather than keeping receivers that may be gone.
+      var items = ok && root.wifiEnabled ? r.items : []
       if (JSON.stringify(items) !== JSON.stringify(root.discovered)) root.discovered = items
       root.scanned = true
       root.rebuild()
@@ -777,7 +782,7 @@ Item {
     command: [root.helperPath, "usb-list"]
     onFinished: function(code, out) {
       var r = Model.parseUsbList(out)
-      if (code === 0 && r.ok) root.applyUsb(r.items)
+      root.applyUsb(code === 0 && r.ok ? r.items : [])
       if (!root.wifiEnabled) { root.scanned = true; root.rebuild() }
     }
   }

@@ -719,11 +719,13 @@ test("linkLabel: USB and Tailscale from the session, else the receiver's report,
   eq(M.linkLabel(undefined, undefined), "Wi-Fi")
 })
 
-test("scanErrorAction: success clears only the scan error", () => {
+test("scanErrorAction: never raises a scan error, clears a stale one", () => {
   eq(M.scanErrorAction(true, true, "error.scanFailed"), "clear")
   eq(M.scanErrorAction(true, true, "error.notFound"), "keep")
   eq(M.scanErrorAction(true, true, ""), "keep")
-  eq(M.scanErrorAction(false, true, ""), "set")
+  eq(M.scanErrorAction(false, true, ""), "keep")
+  eq(M.scanErrorAction(false, true, "error.scanFailed"), "clear")
+  eq(M.scanErrorAction(false, true, "error.notFound"), "keep")
   eq(M.scanErrorAction(false, false, ""), "keep")
 })
 
