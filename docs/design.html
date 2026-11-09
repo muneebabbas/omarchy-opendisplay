@@ -1,0 +1,73 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+:root{--bg:#191919;--bg3:#262626;--sel:#383838;--fg:#c2c2b0;--dim:#8a8a7e;--mut:#666;--line:#363632;--acc:#78824b;--ok:#5f875f;--warn:#b36d43;
+--mono:"JetBrainsMono Nerd Font","JetBrains Mono",ui-monospace,monospace}
+*{box-sizing:border-box}body{margin:0}
+.wrap{display:flex;justify-content:center;gap:12px;flex-wrap:wrap;align-items:flex-start}
+.cap{font:12px var(--font-sans,sans-serif);color:var(--muted-foreground,#999);margin:0 0 6px}
+.panel{background:var(--bg);color:var(--fg);font:12px/1.5 var(--mono);border:1px solid var(--acc);border-radius:6px;padding:16px;width:352px}
+.row{display:flex;align-items:center;gap:10px}.sp{flex:1}
+.t{font-size:15px;font-weight:700}.s{font-size:10px;letter-spacing:.14em;color:var(--dim);text-transform:uppercase}
+.sec{font-size:10px;letter-spacing:.14em;color:var(--dim);text-transform:uppercase;margin:18px 0 8px}
+.btn{border:1px solid var(--line);border-radius:3px;padding:4px 10px;font-size:11px;text-align:center;white-space:nowrap}
+.btn.on{background:var(--sel);border-color:var(--fg)}
+.btn.acc{border-color:var(--acc);background:rgba(120,130,75,.22)}
+.btn.ghost{border-color:transparent;color:var(--dim)}
+.ic{width:22px;height:28px;border:2px solid var(--fg);border-radius:4px;position:relative;flex:none}
+.ic::after{content:"";position:absolute;bottom:2px;left:50%;width:4px;height:2px;margin-left:-2px;background:var(--fg)}
+.ic.sm{width:13px;height:17px;border-width:1.5px;border-radius:2px}.ic.sm::after{bottom:1px;width:3px;height:1px;margin-left:-1.5px}
+.card{background:var(--bg3);border-radius:5px;padding:12px 10px}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ok);margin-right:6px;vertical-align:middle}
+.m{color:var(--dim);font-size:11px}
+.tag{color:var(--dim);font-weight:400;font-size:10px;letter-spacing:.08em;text-transform:uppercase;margin-left:6px}
+.seg{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.adv-t{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:11px;margin-top:10px}
+.adv{border-top:1px solid var(--line);margin-top:10px;padding-top:10px;display:grid;grid-template-columns:1fr auto;gap:7px 10px;align-items:center;font-size:11px}
+.adv .l{color:var(--dim)}
+.adv .f{border:1px solid var(--line);border-radius:3px;padding:1px 8px;min-width:96px;text-align:left}
+.adv .h{grid-column:1/-1;font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--mut);margin-top:4px}
+.tog{width:30px;height:16px;border-radius:3px;background:var(--sel);position:relative;border:1px solid var(--line)}
+.tog::after{content:"";position:absolute;top:2px;right:2px;width:11px;height:10px;background:var(--fg);border-radius:2px}
+.tog.off::after{right:auto;left:2px;background:var(--mut)}
+.dev{display:flex;align-items:center;gap:10px;padding:8px 4px}
+.foot{display:flex;justify-content:space-between;align-items:center;color:var(--dim);font-size:10.5px;margin-top:16px;padding-top:10px;border-top:1px solid var(--line)}
+.up{color:var(--warn)}
+</style></head><body>
+<div class="wrap">
+<div><p class="cap">Default</p>
+<div class="panel">
+  <div class="row"><div class="ic"></div><div class="sp"><div class="t">OpenDisplay</div><div class="s">Extending onto iPad</div></div><div class="btn ghost" title="Rescan">↻</div></div>
+  <div class="sec">Receivers</div>
+  <div class="card">
+    <div class="row"><div class="ic sm"></div><div class="sp"><div style="font-weight:600"><span class="dot"></span>iPad<span class="tag">Wi-Fi</span></div><div class="m">58 fps · 1.4 Mbps · 17 ms</div></div><div class="btn">Disconnect</div></div>
+    <div class="seg" style="margin-top:14px"><div class="btn">Sharp</div><div class="btn on">Balanced</div><div class="btn">Light</div></div>
+    <div class="adv-t">▸ Advanced</div>
+  </div>
+  <div class="dev" style="margin-top:6px"><div class="ic sm" style="border-color:var(--dim)"></div><div class="sp"><div style="font-weight:600">Pixel 8</div><div class="m">last used 2 days ago</div></div><div class="btn acc">Connect</div></div>
+  <div class="foot"><span>od-sender 1.30.2</span><span class="up">Update to 1.31.0 ›</span></div>
+</div></div>
+<div><p class="cap">Advanced open</p>
+<div class="panel">
+  <div class="row"><div class="ic"></div><div class="sp"><div class="t">OpenDisplay</div><div class="s">Extending onto iPad</div></div><div class="btn ghost">↻</div></div>
+  <div class="sec">Receivers</div>
+  <div class="card">
+    <div class="row"><div class="ic sm"></div><div class="sp"><div style="font-weight:600"><span class="dot"></span>iPad<span class="tag">Wi-Fi</span></div><div class="m">58 fps · 1.4 Mbps · 17 ms</div></div><div class="btn">Disconnect</div></div>
+    <div class="seg" style="margin-top:14px"><div class="btn">Sharp</div><div class="btn on">Balanced</div><div class="btn">Light</div></div>
+    <div class="adv-t">▾ Advanced</div>
+    <div class="adv">
+      <span class="l">Auto-connect</span><div class="tog off"></div>
+      <span class="l">Bitrate</span><span class="f">20 Mbit/s</span>
+      <span class="l">Scale</span><span class="f">passthrough ▾</span>
+      <span class="h">All receivers</span>
+      <span class="l">Max fps</span><span class="f">60</span>
+      <span class="l">Encoder</span><span class="f">auto ▾</span>
+      <span class="l">Cursor</span><span class="f">auto ▾</span>
+      <span class="l">Tailscale fallback</span><div class="tog"></div>
+    </div>
+    <div class="row" style="margin-top:10px;font-size:11px;color:var(--dim)"><span class="sp">Changes reconnect the iPad.</span><span>Doctor ›</span></div>
+  </div>
+  <div class="foot"><span>od-sender 1.30.2</span><span class="up">Update to 1.31.0 ›</span></div>
+</div></div>
+</div>
+</body></html>
