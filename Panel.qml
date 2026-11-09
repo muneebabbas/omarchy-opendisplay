@@ -58,7 +58,8 @@ Panel {
     if (cards.length > 1) return strings.tn("bar.tooltipCount", cards.length).arg(Commons.I18n.formatNumber(cards.length))
     if (cards.length === 1) {
       var c = cards[0]
-      if (c.fps >= 0) return strings.t("bar.tooltipLive").arg(c.name).arg(Commons.I18n.formatNumber(Number(Model.formatRate(c.fps))))
+      var fps = statsFor(c.key).fps
+      if (fps >= 0) return strings.t("bar.tooltipLive").arg(c.name).arg(Commons.I18n.formatNumber(Number(Model.formatRate(fps))))
       return strings.t("bar.tooltipLiveNoStats").arg(c.name)
     }
     if (connecting) return strings.t("bar.tooltipConnecting").arg(od.connectingNames[0])
@@ -84,7 +85,56 @@ Panel {
   property var advOpen: ({})
   property bool ipEntryOpen: false
   property bool confirmOpen: false
-  property int inputLocks: 0
+  // Controls that need the keyboard (a focused field, an open dropdown)
+  // register here by name; the panel's own key handling pauses while any is held.
+  property var inputLockHolders: ({})
+  readonly property bool inputLocked: {
+    for (var h in inputLockHolders) if (inputLockHolders[h] === true) return true
+    return false
+  }
+
+  function setInputLock(holder, on) {
+    if ((inputLockHolders[holder] === true) === on) return
+    var next = {}
+    for (var h in inputLockHolders) if (h !== holder) next[h] = inputLockHolders[h]
+    if (on) next[holder] = true
+    inputLockHolders = next
+  }
+
+  // Number edits wait for a pause in typing, then go out together.
+  property var pendingEdits: ({})
+
+  function queueEdit(scope, rid, key, value) {
+    var next = {}
+    for (var e in pendingEdits) next[e] = pendingEdits[e]
+    next[scope + "|" + rid + "|" + key] = { scope: scope, rid: rid, key: key, value: value }
+    pendingEdits = next
+    editDebounce.restart()
+  }
+
+  Timer {
+    id: editDebounce
+    interval: 800
+    onTriggered: {
+      var edits = root.pendingEdits
+      root.pendingEdits = ({})
+      for (var e in edits) {
+        var edit = edits[e]
+        if (edit.scope === "receiver") od.setReceiverOption(edit.rid, edit.key, edit.value)
+        else od.setGlobalOption(edit.key, edit.value)
+      }
+    }
+  }
+
+  // Escape or Enter in a number field hands the keyboard back to the panel.
+  function releaseField(event) {
+    if (event.key === Qt.Key_Escape || event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+      if (panel.loadedContent) panel.loadedContent.forceActiveFocus()
+      event.accepted = true
+    }
+  }
+
+  function statsFor(key) { return od.stats[key] || ({}) }
 
   function advKey(id, key) { return id !== "" ? id.toUpperCase() : key }
   function isAdvOpen(k) { return advOpen[k] === true }
@@ -103,7 +153,7 @@ Panel {
     }
     for (var j = 0; j < others.length; j++) {
       var k2 = advKey(others[j].id, others[j].key)
-      if (others[j].id !== "" && isAdvOpen(k2)) return k2
+      if (others[j].id !== "" && others[j].state !== "waiting" && isAdvOpen(k2)) return k2
     }
     return ""
   }
@@ -114,6 +164,27 @@ Panel {
   property int cursorIndex: 0
   property int presetCursor: 1
 
+  // "kind" or "kind:arg"; the arg may itself contain colons.
+  function navKey(kind, key) { return key === undefined ? kind : kind + ":" + key }
+  function parseNavKey(k) {
+    var i = String(k).indexOf(":")
+    return i === -1 ? { kind: String(k), arg: "" } : { kind: k.substring(0, i), arg: k.substring(i + 1) }
+  }
+
+  // The Advanced controls of one open section, in visual order.
+  function pushAdvancedKeys(keys, akey) {
+    keys.push(navKey("auto", akey))
+    keys.push(navKey("bitrate", akey))
+    keys.push(navKey("scale", akey))
+    if (firstAdvKey === akey) {
+      keys.push(navKey("fps"))
+      keys.push(navKey("encoder"))
+      keys.push(navKey("cursor"))
+      keys.push(navKey("tailscale"))
+    }
+    keys.push(navKey("doctor", akey))
+  }
+
   readonly property var navKeys: {
     var keys = []
     if (od.installed) keys.push("rescan")
@@ -123,14 +194,19 @@ Panel {
     }
     for (var i = 0; i < cards.length; i++) {
       var c = cards[i]
-      keys.push("disc:" + c.key)
-      if (c.id !== "") { keys.push("preset:" + c.key); keys.push("adv:" + c.key) }
+      keys.push(navKey("disc", c.key))
+      if (c.id !== "") {
+        keys.push(navKey("preset", c.key))
+        keys.push(navKey("adv", c.key))
+        if (isAdvOpen(advKey(c.id, c.key))) pushAdvancedKeys(keys, advKey(c.id, c.key))
+      }
     }
     for (var j = 0; j < others.length; j++) {
       var o = others[j]
       if (o.id === "" || o.state === "waiting") continue
-      if (o.state !== "connecting") keys.push("conn:" + o.key)
-      keys.push("chev:" + o.key)
+      if (o.state !== "connecting") keys.push(navKey("conn", o.key))
+      keys.push(navKey("chev", o.key))
+      if (isAdvOpen(advKey(o.id, o.key))) pushAdvancedKeys(keys, advKey(o.id, o.key))
     }
     if (showEmpty) { keys.push("emptyRescan"); keys.push("emptyIp"); keys.push("emptyDoctor") }
     if (footerClickable) keys.push("footer")
@@ -157,15 +233,16 @@ Panel {
 
   function moveCursor(dx, dy) {
     ensureCursor()
-    if (dx !== 0 && cursorKey.indexOf("preset:") === 0) {
-      presetCursor = Math.max(0, Math.min(2, presetCursor + dx))
+    if (dx !== 0 && parseNavKey(cursorKey).kind === "preset") {
+      presetCursor = Math.max(0, Math.min(Model.PRESET_NAMES.length - 1, presetCursor + dx))
       return
     }
     if (dy === 0) return
     var i = navKeys.indexOf(cursorKey)
     var next = Math.max(0, Math.min(navKeys.length - 1, i + dy))
     if (next >= 0 && next < navKeys.length) { cursorKey = navKeys[next]; cursorIndex = next }
-    if (cursorKey.indexOf("preset:") === 0) presetCursor = presetIndexFor(cardByKey(cursorKey.substring(7)))
+    var parsed = parseNavKey(cursorKey)
+    if (parsed.kind === "preset") presetCursor = presetIndexFor(cardByKey(parsed.arg))
     scrollCursorIntoView()
   }
 
@@ -180,14 +257,22 @@ Panel {
 
   function presetIndexFor(card) {
     if (!card) return 1
-    var p = Model.presetForBitrate(Model.effectiveBitrate(od.config, card.id))
-    return p === "sharp" ? 0 : (p === "light" ? 2 : 1)
+    var i = Model.PRESET_NAMES.indexOf(Model.presetForBitrate(Model.effectiveBitrate(od.config, card.id)))
+    return i === -1 ? 1 : i
+  }
+
+  // The card or row whose Advanced section has this key.
+  function receiverByAkey(akey) {
+    for (var i = 0; i < cards.length; i++) if (advKey(cards[i].id, cards[i].key) === akey) return cards[i]
+    for (var j = 0; j < others.length; j++) if (advKey(others[j].id, others[j].key) === akey) return others[j]
+    return null
   }
 
   function activateCursor() {
     ensureCursor()
     var k = cursorKey
-    var arg = k.indexOf(":") !== -1 ? k.substring(k.indexOf(":") + 1) : ""
+    var p = parseNavKey(k)
+    var arg = p.arg
     if (k === "rescan" || k === "emptyRescan") od.scan()
     else if (k === "retry") od.checkUpdate(true)
     else if (k === "install") requestInstall()
@@ -195,19 +280,32 @@ Panel {
     else if (k === "emptyIp") openIpEntry()
     else if (k === "emptyDoctor") od.openDoctor()
     else if (k === "footer") footerAction()
-    else if (k.indexOf("disc:") === 0) od.disconnect(od.targetFor(cardByKey(arg)))
-    else if (k.indexOf("preset:") === 0) {
+    else if (p.kind === "disc") od.disconnect(od.targetFor(cardByKey(arg)))
+    else if (p.kind === "preset") {
       var c = cardByKey(arg)
-      if (c) od.setPreset(c.id, ["sharp", "balanced", "light"][presetCursor])
-    } else if (k.indexOf("adv:") === 0) {
+      if (c) od.setPreset(c.id, Model.PRESET_NAMES[presetCursor])
+    } else if (p.kind === "adv") {
       var c2 = cardByKey(arg)
       if (c2) toggleAdv(advKey(c2.id, c2.key))
-    } else if (k.indexOf("conn:") === 0) {
+    } else if (p.kind === "conn") {
       var r = rowByKey(arg)
       if (r) od.connect(r.id)
-    } else if (k.indexOf("chev:") === 0) {
+    } else if (p.kind === "chev") {
       var r2 = rowByKey(arg)
       if (r2) toggleAdv(advKey(r2.id, r2.key))
+    } else if (p.kind === "auto") {
+      var r3 = receiverByAkey(arg)
+      if (r3 && !od.busy) od.setAutoConnect(r3.id, r3.autoConnect !== true)
+    } else if (k === "tailscale") {
+      if (!od.busy) od.setGlobalOption("tailscale", Model.globalValue(od.config, "tailscale", true) !== false ? "false" : "true")
+    } else if (p.kind === "bitrate" || k === "fps") {
+      var field = panel.loadedContent ? panel.loadedContent.findTarget(k) : null
+      if (field) field.field.forceActiveFocus()
+    } else if (p.kind === "scale" || k === "encoder" || k === "cursor") {
+      var dropdown = panel.loadedContent ? panel.loadedContent.findTarget(k) : null
+      if (dropdown) dropdown.open()
+    } else if (p.kind === "doctor") {
+      od.openDoctor()
     }
   }
 
@@ -248,8 +346,7 @@ Panel {
   }
 
   function persistKnown(id, name, addr, when) {
-    var prev = Model.findKnown(knownReceivers, id)
-    if (prev && prev.lastUsed >= when && (name === "" || prev.name === Model.clampText(name, 64))) return
+    if (!Model.shouldRemember(knownReceivers, id, name, when)) return
     var next = Model.rememberReceiver(knownReceivers, id, name, addr, when)
     if (!root.bar || !root.bar.shell || typeof root.bar.shell.updateEntryInline !== "function") return
     var entry = { id: root.moduleName }
@@ -259,29 +356,29 @@ Panel {
   }
 
   function rightClick() {
-    if (!od.installed) { root.open(); return }
-    if (cards.length > 0 || connecting) { od.disconnectAll(); return }
-    var last = Model.lastUsedReceiver(knownReceivers)
-    if (!last) { od.notify(strings.t("error.noRecent"), "norecent:" + Date.now()); return }
-    // By id only: it streams the desktop, so never jump to a lookalike name.
-    var online = false
-    for (var i = 0; i < others.length; i++) if (Model.sameId(others[i].id, last.id) && others[i].state !== "waiting") online = true
-    if (!online && od.scanned) { od.notify(strings.t("error.recentMissing").arg(last.name), "missing:" + Date.now()); return }
-    od.connect(last.id)
+    var result = od.toggleLast()
+    if (result === "notinstalled") root.open()
+    else if (result === "none") od.notify(strings.t("error.noRecent"), "norecent:" + Date.now())
+    else if (result === "missing") {
+      var last = Model.lastUsedReceiver(root.knownReceivers)
+      od.notify(strings.t("error.recentMissing").arg(last ? last.name : ""), "missing:" + Date.now())
+    }
   }
 
   function statsLine(card) {
+    var st = statsFor(card.key)
     if (card.state === "reconnecting") return strings.t("row.reconnecting")
-    if (card.external && card.fps < 0) return strings.t("row.external")
+    if (card.external && !(st.fps >= 0)) return strings.t("row.external")
     var dash = "–"
-    var fps = card.fps >= 0 ? strings.t("stats.fps").arg(Commons.I18n.formatNumber(Number(Model.formatRate(card.fps)))) : strings.t("stats.fps").arg(dash)
-    var mbps = card.mbps >= 0 ? strings.t("stats.mbps").arg(Commons.I18n.formatNumber(card.mbps, card.mbps >= 10 ? 0 : 1)) : strings.t("stats.mbps").arg(dash)
-    var ms = card.latency >= 0 ? strings.t("stats.ms").arg(Commons.I18n.formatNumber(card.latency)) : strings.t("stats.ms").arg(dash)
-    return fps + " · " + mbps + " · " + ms
+    var fps = st.fps >= 0 ? Commons.I18n.formatNumber(Number(Model.formatRate(st.fps))) : dash
+    var mbps = st.mbps >= 0 ? Commons.I18n.formatNumber(st.mbps, st.mbps >= 10 ? 0 : 1) : dash
+    var ms = st.latency >= 0 ? Commons.I18n.formatNumber(st.latency) : dash
+    return strings.t("stats.line").arg(fps).arg(mbps).arg(ms)
   }
 
   function rowSecondary(row) {
     if (row.state === "waiting") return strings.t("row.waiting")
+    if (row.state === "paused") return strings.t("row.paused")
     if (row.lastUsedDays === 0) return strings.t("row.lastUsedToday")
     if (row.lastUsedDays > 0) return strings.tn("row.lastUsedDays", row.lastUsedDays).arg(Commons.I18n.formatNumber(row.lastUsedDays))
     return row.addr
@@ -290,13 +387,18 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  onOpenedChanged: if (opened) {
-    cursorActive = false
-    ipEntryOpen = false
-    confirmOpen = false
-    if (panelFlick) panelFlick.contentY = 0
-    od.onPanelOpened()
-    Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() })
+  onOpenedChanged: {
+    if (opened) {
+      cursorActive = false
+      ipEntryOpen = false
+      confirmOpen = false
+      if (panelFlick) panelFlick.contentY = 0
+      od.onPanelOpened()
+      Qt.callLater(function() { if (panel.loadedContent) panel.loadedContent.forceActiveFocus() })
+    } else {
+      // A control destroyed or hidden mid-edit must not leave the keys dead.
+      inputLockHolders = ({})
+    }
   }
   onNavKeysChanged: ensureCursor()
 
@@ -400,7 +502,7 @@ Panel {
       property alias panelFlick: panelFlick
       implicitHeight: column.implicitHeight
       anchors.fill: parent
-      blocked: root.confirmOpen || root.inputLocks > 0 || ipField.activeFocus
+      blocked: root.confirmOpen || root.inputLocked || ipField.activeFocus
 
       function focusIpField() { ipField.forceActiveFocus() }
       function focusConfirm() { confirmHost.forceActiveFocus() }
@@ -766,7 +868,7 @@ Panel {
                     if (root.footerKind === "updating") return strings.t("footer.updating")
                     if (root.footerKind === "updated") return strings.t("footer.updated").arg(od.updateMessage)
                     if (root.footerKind === "pacman") return strings.t("footer.pacman")
-                    if (root.footerKind === "error") return od.updateMessage + " · " + strings.t("footer.details")
+                    if (root.footerKind === "error") return strings.t("footer.error").arg(od.updateMessage)
                     return ""
                   }
                   color: root.footerKind === "update" || root.footerKind === "error" ? root.urgent : root.dim
@@ -908,7 +1010,7 @@ Panel {
               textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
               visible: text !== ""
-              text: Model.transportLabel(cardRoot.card.transport || "").toUpperCase()
+              text: Model.transportLabel(root.statsFor(cardRoot.card.key).transport || "").toUpperCase()
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -928,7 +1030,7 @@ Panel {
         }
 
         Button {
-          property string navKey: "disc:" + cardRoot.card.key
+          property string navKey: root.navKey("disc", cardRoot.card.key)
           text: strings.t("action.disconnect")
           bordered: true
           foreground: root.foreground
@@ -943,13 +1045,13 @@ Panel {
       // Presets: equal-width chips; the hint shows on hover and keyboard cursor.
       Row {
         id: presetRow
-        property string navKey: "preset:" + cardRoot.card.key
+        property string navKey: root.navKey("preset", cardRoot.card.key)
         visible: cardRoot.hasId
         width: parent.width
         spacing: Style.space(8)
 
         Repeater {
-          model: ["sharp", "balanced", "light"]
+          model: Model.PRESET_NAMES
           Button {
             id: presetButton
             required property string modelData
@@ -976,7 +1078,7 @@ Panel {
       Expander {
         visible: cardRoot.hasId
         width: parent.width
-        navKey: "adv:" + cardRoot.card.key
+        navKey: root.navKey("adv", cardRoot.card.key)
         open: root.isAdvOpen(cardRoot.akey)
         onToggled: root.toggleAdv(cardRoot.akey)
       }
@@ -989,6 +1091,7 @@ Panel {
           rid: cardRoot.card.id || ""
           receiverName: cardRoot.card.name || ""
           connected: true
+          akey: cardRoot.akey
           autoConnect: cardRoot.card.autoConnect === true
           showGlobals: root.firstAdvKey === cardRoot.akey
         }
@@ -1052,7 +1155,7 @@ Panel {
 
         Button {
           id: chevButton
-          property string navKey: "chev:" + rowRoot.row.key
+          property string navKey: root.navKey("chev", rowRoot.row.key)
           property bool mouseOver: false
           visible: rowRoot.canExpand
           iconText: "\u{f0140}"
@@ -1072,7 +1175,7 @@ Panel {
         }
 
         Button {
-          property string navKey: "conn:" + rowRoot.row.key
+          property string navKey: root.navKey("conn", rowRoot.row.key)
           visible: !rowRoot.waiting && (rowRoot.row.id || "") !== "" || rowRoot.isConnecting
           text: rowRoot.isConnecting ? strings.t("action.connecting") : strings.t("action.connect")
           iconText: rowRoot.isConnecting ? "\u{f0450}" : ""
@@ -1106,6 +1209,7 @@ Panel {
             rid: rowRoot.row.id || ""
             receiverName: rowRoot.row.name || ""
             connected: false
+            akey: rowRoot.akey
             autoConnect: rowRoot.row.autoConnect === true
             showGlobals: root.firstAdvKey === rowRoot.akey
             showSeparator: false
@@ -1184,6 +1288,7 @@ Panel {
   component AdvancedSection: Column {
     id: adv
     property string rid: ""
+    property string akey: ""
     property string receiverName: ""
     property bool connected: false
     property bool autoConnect: false
@@ -1201,10 +1306,14 @@ Panel {
       label: strings.t("advanced.autoConnect")
       ToggleSwitch {
         id: autoSwitch
+        property string navKey: root.navKey("auto", adv.akey)
         checked: adv.autoConnect
         busy: od.busy
-        cursorRing: false
+        cursorRing: true
+        cursorPad: Style.space(2)
+        hasCursor: root.hasCursor(navKey)
         foreground: root.foreground
+        onHovered: function(h) { if (h) root.setCursor(navKey) }
         onToggled: od.setAutoConnect(adv.rid, !adv.autoConnect)
         PanelToolTip {
           visible: autoSwitch.containsMouse
@@ -1220,23 +1329,23 @@ Panel {
         spacing: Style.space(6)
         NumberField {
           id: bitrateField
+          property string navKey: root.navKey("bitrate", adv.akey)
+          readonly property string lockId: "bitrate|" + adv.rid
           fieldWidth: adv.controlWidth - mbpsLabel.implicitWidth - Style.space(6)
           from: 1
           to: 200
           value: Math.round(Model.effectiveBitrate(od.config, adv.rid))
           foreground: root.foreground
           fontFamily: root.fontFamily
-          onModified: function(v) { bitrateDebounce.pending = v; bitrateDebounce.restart() }
+          hasCursor: root.hasCursor(navKey)
+          onHovered: function(h) { if (h) root.setCursor(navKey) }
+          onModified: function(v) { root.queueEdit("receiver", adv.rid, "bitrate-mbps", v) }
+          Keys.onPressed: function(event) { root.releaseField(event) }
           Connections {
             target: bitrateField.field
-            function onActiveFocusChanged() { root.inputLocks += bitrateField.field.activeFocus ? 1 : -1 }
+            function onActiveFocusChanged() { root.setInputLock(bitrateField.lockId, bitrateField.field.activeFocus) }
           }
-          Timer {
-            id: bitrateDebounce
-            property int pending: 0
-            interval: 800
-            onTriggered: od.setReceiverOption(adv.rid, "bitrate-mbps", pending)
-          }
+          Component.onDestruction: root.setInputLock(lockId, false)
         }
         Text {
           id: mbpsLabel
@@ -1253,14 +1362,20 @@ Panel {
     SettingRow {
       label: strings.t("advanced.scale")
       Dropdown {
+        id: scaleDropdown
+        property string navKey: root.navKey("scale", adv.akey)
+        readonly property string lockId: "scale|" + adv.rid
         width: adv.controlWidth
         options: adv.scaleOptions
         value: adv.scaleValue
         showLabel: false
         foreground: root.foreground
         fontFamily: root.fontFamily
-        onPopupOpenChanged: root.inputLocks += popupOpen ? 1 : -1
-        onChanged: function(v) { od.setReceiverOption(adv.rid, "scale", v === "passthrough" ? "" : v) }
+        hasCursor: root.hasCursor(navKey)
+        onHovered: function(h) { if (h) root.setCursor(navKey) }
+        onPopupOpenChanged: root.setInputLock(lockId, popupOpen)
+        onChanged: function(v) { od.setScale(adv.rid, v) }
+        Component.onDestruction: root.setInputLock(lockId, false)
       }
     }
 
@@ -1278,23 +1393,22 @@ Panel {
       label: strings.t("advanced.maxFps")
       NumberField {
         id: fpsField
+        property string navKey: root.navKey("fps")
         fieldWidth: adv.controlWidth
         from: 1
         to: 240
         value: Number(Model.globalValue(od.config, "max-fps", 60))
         foreground: root.foreground
         fontFamily: root.fontFamily
-        onModified: function(v) { fpsDebounce.pending = v; fpsDebounce.restart() }
+        hasCursor: root.hasCursor(navKey)
+        onHovered: function(h) { if (h) root.setCursor(navKey) }
+        onModified: function(v) { root.queueEdit("global", "", "max-fps", v) }
+        Keys.onPressed: function(event) { root.releaseField(event) }
         Connections {
           target: fpsField.field
-          function onActiveFocusChanged() { root.inputLocks += fpsField.field.activeFocus ? 1 : -1 }
+          function onActiveFocusChanged() { root.setInputLock("fps", fpsField.field.activeFocus) }
         }
-        Timer {
-          id: fpsDebounce
-          property int pending: 0
-          interval: 800
-          onTriggered: od.setGlobalOption("max-fps", pending)
-        }
+        Component.onDestruction: root.setInputLock("fps", false)
       }
     }
 
@@ -1302,14 +1416,18 @@ Panel {
       visible: adv.showGlobals
       label: strings.t("advanced.encoder")
       Dropdown {
+        property string navKey: root.navKey("encoder")
         width: adv.controlWidth
         options: Model.ENCODERS
         value: String(Model.globalValue(od.config, "encoder", "auto"))
         showLabel: false
         foreground: root.foreground
         fontFamily: root.fontFamily
-        onPopupOpenChanged: root.inputLocks += popupOpen ? 1 : -1
+        hasCursor: root.hasCursor(navKey)
+        onHovered: function(h) { if (h) root.setCursor(navKey) }
+        onPopupOpenChanged: root.setInputLock("encoder", popupOpen)
         onChanged: function(v) { od.setGlobalOption("encoder", v) }
+        Component.onDestruction: root.setInputLock("encoder", false)
       }
     }
 
@@ -1317,14 +1435,18 @@ Panel {
       visible: adv.showGlobals
       label: strings.t("advanced.cursor")
       Dropdown {
+        property string navKey: root.navKey("cursor")
         width: adv.controlWidth
         options: Model.CURSORS
         value: String(Model.globalValue(od.config, "cursor", "auto"))
         showLabel: false
         foreground: root.foreground
         fontFamily: root.fontFamily
-        onPopupOpenChanged: root.inputLocks += popupOpen ? 1 : -1
+        hasCursor: root.hasCursor(navKey)
+        onHovered: function(h) { if (h) root.setCursor(navKey) }
+        onPopupOpenChanged: root.setInputLock("cursor", popupOpen)
         onChanged: function(v) { od.setGlobalOption("cursor", v) }
+        Component.onDestruction: root.setInputLock("cursor", false)
       }
     }
 
@@ -1332,10 +1454,14 @@ Panel {
       visible: adv.showGlobals
       label: strings.t("advanced.tailscale")
       ToggleSwitch {
+        property string navKey: root.navKey("tailscale")
         readonly property bool on: Model.globalValue(od.config, "tailscale", true) !== false
         checked: on
         busy: od.busy
-        cursorRing: false
+        cursorRing: true
+        cursorPad: Style.space(2)
+        hasCursor: root.hasCursor(navKey)
+        onHovered: function(h) { if (h) root.setCursor(navKey) }
         foreground: root.foreground
         onToggled: od.setGlobalOption("tailscale", on ? "false" : "true")
       }
@@ -1359,6 +1485,9 @@ Panel {
       }
       LinkText {
         id: advDoctor
+        property string navKey: root.navKey("doctor", adv.akey)
+        hasCursor: root.hasCursor(navKey)
+        onHovered: root.setCursor(navKey)
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
         text: strings.t("advanced.doctor")

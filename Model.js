@@ -25,6 +25,8 @@ var PRESETS = [
   { name: "light", bitrate: 8 }
 ]
 
+var PRESET_NAMES = PRESETS.map(function (p) { return p.name })
+
 var ENCODERS = ["auto", "x264", "openh264", "v4l2m2m"]
 var CURSORS = ["auto", "video", "off"]
 var SCALE_CHOICES = ["passthrough", "mac", "1", "1.5", "2", "3"]
@@ -75,17 +77,6 @@ function hexOnly(id) {
 function outputNameForId(id) {
   if (!isValidId(id)) return ""
   return "od-" + hexOnly(id).substring(0, 6)
-}
-
-function transientUnitForId(id) {
-  if (!isValidId(id)) return ""
-  return "opendisplay-" + hexOnly(id).substring(0, 8) + ".service"
-}
-
-// systemd-escape for the characters an id can contain (hex and "-").
-function templateUnitForId(id) {
-  if (!isValidId(id)) return ""
-  return "od-sender@" + id.replace(/-/g, "\\x2d") + ".service"
 }
 
 function sameId(a, b) {
@@ -231,11 +222,6 @@ function transportLabel(value) {
 
 // ------------------------------------------------------------------ version + release
 
-function parseVersionText(text) {
-  var m = /^od-sender (\d+\.\d+\.\d+)/.exec(String(text || ""))
-  return m ? m[1] : ""
-}
-
 function versionParts(v) {
   var m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(v || ""))
   if (!m) return null
@@ -327,6 +313,19 @@ function effectiveScale(config, id) {
   if (v === undefined) v = config ? config.scale : undefined
   if (v === undefined || v === null) return "passthrough"
   return String(v)
+}
+
+// Scale for the receiver table. Passthrough deletes the key only when the
+// top-level scale would give the same result; otherwise it is written
+// explicitly so it overrides the top-level value.
+function scaleChange(config, id, value) {
+  var text = String(value)
+  if (text === "passthrough") {
+    var top = config ? config.scale : undefined
+    var inherit = top === undefined || top === null || String(top) === "passthrough"
+    return { key: "scale", value: inherit ? "" : "passthrough" }
+  }
+  return { key: "scale", value: text }
 }
 
 function globalValue(config, key, fallback) {
@@ -451,7 +450,8 @@ function idForOutput(output, discovered, known) {
 
 // cards: one per live session (connected or reconnecting).
 // others: discovered receivers that aren't live (possibly connecting), plus
-// offline receivers with auto-connect on, shown as waiting.
+// offline receivers with auto-connect on: waiting when their template unit
+// is running, paused when it isn't (e.g. the user disconnected it).
 function mergeReceivers(discovered, known, sessions, autoIds, now) {
   var disc = discovered instanceof Array ? discovered : []
   var knownList = sanitizeKnown(known)
@@ -526,13 +526,221 @@ function mergeReceivers(discovered, known, sessions, autoIds, now) {
     var auto = isAuto(id)
     others.push({
       key: id, id: id, name: nameFor(id, ""), addr: kk ? kk.lastAddr : "",
-      state: cs && cs.state === "connecting" ? "connecting" : (auto ? "waiting" : "idle"),
+      state: cs && cs.state === "connecting" ? "connecting"
+        : (auto ? (cs && cs.state === "waiting" ? "waiting" : "paused") : "idle"),
       autoConnect: auto,
       lastUsedDays: kk ? relativeDays(kk.lastUsed, now) : -1,
       unit: cs ? (cs.unit || "") : ""
     })
   }
   return { cards: cards, others: others }
+}
+
+function hasSessionId(list, id) {
+  for (var i = 0; i < list.length; i++) if (list[i].id && String(list[i].id).toUpperCase() === String(id).toUpperCase()) return true
+  return false
+}
+
+function blank(o) {
+  o.fps = -1; o.mbps = -1; o.latency = -1; o.transport = ""
+  return o
+}
+
+// Everything the panel shows as a session, from helper status plus what the
+// log tails learned. Pure: inputs are never modified.
+function buildSessions(status, live, pending, discovered, known, now) {
+  var st = status || {}
+  var lv = live || {}
+  var pd = pending || {}
+  var ss = st.sessions instanceof Array ? st.sessions : []
+  var us = st.units instanceof Array ? st.units : []
+  var out = []
+  var seen = {}
+
+  for (var i = 0; i < ss.length; i++) {
+    var s = ss[i]
+    var key = s.unit !== "" ? s.unit : s.output
+    var l = lv[key] || {}
+    var id = s.id || l.id || idForOutput(s.output, discovered, known)
+    var state = "live"
+    if (s.unit !== "" && l.tailStartMs && now - Math.max(l.tailStartMs, l.lastLogMs || 0) > 15000) state = "reconnecting"
+    if (s.unit !== "") seen[s.unit] = true
+    out.push({
+      key: key, id: id, unit: s.unit, output: s.output, pid: s.pid, to: s.to,
+      external: s.unit === "", template: s.unit.indexOf("od-sender@") === 0,
+      name: l.name || "", state: state,
+      fps: l.fps === undefined ? -1 : l.fps,
+      mbps: l.mbps === undefined ? -1 : l.mbps,
+      latency: l.latency === undefined ? -1 : l.latency,
+      transport: l.transport || ""
+    })
+  }
+
+  for (var j = 0; j < us.length; j++) {
+    var u = us[j]
+    if (seen[u.unit] || (u.state !== "active" && u.state !== "activating")) continue
+    var ul = lv[u.unit] || {}
+    seen[u.unit] = true
+    out.push(blank({
+      key: u.unit, id: u.id || ul.id || "", unit: u.unit, output: "", to: u.to, external: false,
+      template: u.template, name: ul.name || "", state: u.template ? "waiting" : "connecting"
+    }))
+  }
+
+  for (var p in pd) {
+    var pid = pd[p].id || p
+    if (hasSessionId(out, pid)) continue
+    out.push(blank({
+      key: "pending:" + String(pid).toUpperCase(), id: pid, unit: "", output: "", to: "", external: false,
+      template: false, name: "", state: "connecting"
+    }))
+  }
+  return out
+}
+
+// Settles Connect clicks against fresh helper status. A failed unit older than
+// the click is stale and is not blamed for it.
+function reconcilePending(pending, pendingUnits, status, now) {
+  var st = status || {}
+  var ss = st.sessions instanceof Array ? st.sessions : []
+  var us = st.units instanceof Array ? st.units : []
+  var np = {}
+  var nu = {}
+  var failures = []
+
+  function running(u) { return u.state === "active" || u.state === "activating" }
+
+  for (var key in pending) {
+    var entry = pending[key]
+    var id = entry.id || key
+    var resolved = hasSessionId(ss, id)
+    var failed = null
+    var present = resolved
+    for (var i = 0; i < us.length; i++) {
+      if (!us[i].id || us[i].id.toUpperCase() !== String(id).toUpperCase()) continue
+      // A running transient unit is still connecting (od-sender searches for
+      // up to 10 s before failing), so only a live session resolves the
+      // connect. A running auto-connect template means the helper left it to
+      // that unit, which is as good as done.
+      if (running(us[i])) { present = true; if (us[i].template) resolved = true }
+      else if (us[i].state === "failed" && us[i].since * 1000 >= entry.since - 1000) failed = us[i]
+    }
+    if (resolved) continue
+    if (failed) { failures.push({ unit: failed.unit, status: failed.status, id: id }); continue }
+    if (!present && now - entry.since > 30000) continue
+    np[key] = entry
+  }
+
+  for (var unit in pendingUnits) {
+    var since = pendingUnits[unit]
+    var done = false
+    var bad = null
+    var alive = false
+    for (var j = 0; j < ss.length; j++) if (ss[j].unit === unit) done = true
+    for (var k = 0; k < us.length; k++) {
+      if (us[k].unit !== unit) continue
+      if (running(us[k])) alive = true
+      else if (us[k].state === "failed" && us[k].since * 1000 >= since - 1000) bad = us[k]
+    }
+    if (done) continue
+    if (bad) { failures.push({ unit: unit, status: bad.status, id: bad.id || "" }); continue }
+    if (!alive && now - since > 30000) continue
+    nu[unit] = since
+  }
+  return { pending: np, pendingUnits: nu, failures: failures }
+}
+
+// Folds one parsed log line into a unit's live entry.
+function reduceLive(entry, parsed, now, opts) {
+  var l = {}
+  for (var f in entry) l[f] = entry[f]
+  var o = opts || {}
+  var r = parsed
+  var fx = { needStatus: false, used: null, notifyConnected: false }
+  var identity = r.kind === "hello" || r.kind === "extending"
+
+  if (o.historic === true) {
+    if (r.kind === "connected" && !l.addr) l.addr = r.addr
+    if (identity && r.name !== "" && !l.name) l.name = r.name
+    if (identity && r.id !== "" && !l.id) l.id = r.id
+    if (r.kind === "extending" && l.id) fx.used = { id: l.id, name: l.name || "", addr: l.addr || "", ts: r.ts > 0 ? r.ts : now }
+    return { entry: l, effects: fx }
+  }
+
+  l.lastLogMs = now
+  if (r.ts > 0) l.lastLogTs = r.ts
+  if (r.kind === "sent") { l.fps = r.fps; l.mbps = r.mbps }
+  else if (r.kind === "phone") {
+    if (r.e2e50 >= 0) l.latency = r.e2e50
+    if (r.transport !== "") l.transport = r.transport
+  } else if (r.kind === "connected") {
+    l.addr = r.addr
+    delete l.fps; delete l.mbps; delete l.latency
+    fx.needStatus = true
+  } else if (r.kind === "hello") {
+    if (r.name !== "") l.name = r.name
+    if (r.id !== "") l.id = r.id
+  } else if (r.kind === "extending") {
+    if (r.name !== "") l.name = r.name
+    if (r.id !== "") l.id = r.id
+    fx.needStatus = true
+    if (l.id) fx.used = { id: l.id, name: l.name || "", addr: l.addr || "", ts: r.ts > 0 ? r.ts : now }
+    fx.notifyConnected = r.ts > 0 && r.ts >= (o.tailStartMs || 0) - 2000
+  } else if (r.kind === "ended") {
+    fx.needStatus = true
+  } else if (r.kind === "error") {
+    l.lastError = r.text
+  }
+  return { entry: l, effects: fx }
+}
+
+// The journal timestamp is identical in every per-monitor copy of the widget,
+// so these keys let the notification helper dedupe across monitors.
+function droppedNotificationKey(unit, entry) {
+  return "dropped:" + unit + ":" + (entry && entry.lastLogTs || 0)
+}
+
+function connectedNotificationKey(unit, ts) {
+  return "connected:" + unit + ":" + ts
+}
+
+function pick(list, fields) {
+  var out = []
+  for (var i = 0; i < list.length; i++) {
+    var o = {}
+    for (var f = 0; f < fields.length; f++) o[fields[f]] = list[i][fields[f]]
+    out.push(o)
+  }
+  return JSON.stringify(out)
+}
+
+// Structure only (no live stats), so a stats tick doesn't rebuild the lists.
+function cardsSignature(cards) {
+  return pick(cards instanceof Array ? cards : [], ["key", "id", "name", "state", "autoConnect", "external", "template", "unit", "output"])
+}
+
+function othersSignature(others) {
+  return pick(others instanceof Array ? others : [], ["key", "id", "name", "addr", "state", "autoConnect", "lastUsedDays", "unit"])
+}
+
+// Helper exit code to i18n key. "" means show the raw stderr line.
+function helperError(code) {
+  if (code === 2) return { key: "error.invalidValue", doctor: false }
+  if (code === 5) return { key: "error.cantRun", doctor: true }
+  if (code === 6) return { key: "error.rejected", doctor: true }
+  if (code === 7) return { key: "error.autoConnectUnit", doctor: false }
+  if (code === 8) return { key: "error.notInstalled", doctor: false }
+  if (code === 9) return { key: "error.externalSender", doctor: false }
+  if (code === 10) return { key: "error.packageManaged", doctor: false }
+  if (code === 11) return { key: "error.offline", doctor: false }
+  return { key: "", doctor: false }
+}
+
+// False when the stored entry is already current, so nothing needs writing.
+function shouldRemember(known, id, name, when) {
+  var prev = findKnown(known, id)
+  if (prev && prev.lastUsed >= when && (name === "" || prev.name === clampText(name, MAX_NAME))) return false
+  return true
 }
 
 // Resolves an IPC "connect <name>" by id, or by name only when unambiguous.

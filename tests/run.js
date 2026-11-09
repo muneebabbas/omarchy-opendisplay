@@ -57,12 +57,10 @@ test("addresses are host:port with a valid port and no leading dash", () => {
 
 test("unit and output names for the fixture id", () => {
   eq(M.outputNameForId(ID), "od-a0ec23")
-  eq(M.transientUnitForId(ID), "opendisplay-a0ec2343.service")
-  eq(M.templateUnitForId(ID), "od-sender@A0EC2343\\x2dF05E\\x2d4776\\x2d8903\\x2d8C62BB114896.service")
   eq(M.outputNameForId("nope"), "")
   ok(M.isValidUnit("opendisplay-a0ec2343.service"))
   ok(M.isValidUnit("opendisplay-addr-0123abcd.service"))
-  ok(M.isValidUnit(M.templateUnitForId(ID)))
+  ok(M.isValidUnit("od-sender@A0EC2343\\x2dF05E\\x2d4776\\x2d8903\\x2d8C62BB114896.service"))
   ok(!M.isValidUnit("opendisplay-a0ec2343.service; rm"))
   ok(!M.isValidUnit("sshd.service"))
 })
@@ -202,8 +200,6 @@ test("compareVersions is numeric", () => {
   eq(M.compareVersions("1.31.0", "1.100.0"), -1)
   eq(M.compareVersions("v1.100.0", "1.31.0"), 1)
   eq(M.compareVersions("1.30.2", "v1.30.2"), 0)
-  eq(M.parseVersionText("od-sender 1.30.2\n"), "1.30.2")
-  eq(M.parseVersionText("garbage"), "")
 })
 
 test("version and update info are validated", () => {
@@ -295,7 +291,7 @@ test("mergeReceivers: discovered + known + auto-connect + external session", () 
   eq(r.cards.length, 1)
   eq(r.cards[0].name, "iPad")
   eq(r.cards[0].external, true)
-  eq(r.others.map(o => [o.name, o.state, o.lastUsedDays]), [["Pixel 8", "idle", 2], ["Mac", "waiting", 1]])
+  eq(r.others.map(o => [o.name, o.state, o.lastUsedDays]), [["Pixel 8", "idle", 2], ["Mac", "paused", 1]])
 })
 
 test("mergeReceivers: connecting rows, including connect-by-IP without an id", () => {
@@ -325,6 +321,273 @@ test("resolveTarget connects by id, or by a unique name only", () => {
   eq(M.resolveTarget(MARKUP, rows).error, "notfound")
 })
 
+
+// ------------------------------------------------------------------ shared corpus
+
+test("shared validation corpus", () => {
+  const c = JSON.parse(fixture("validation.json"))
+  for (const v of c.ids.valid) ok(M.isValidId(v), "id should be valid: " + v)
+  for (const v of c.ids.invalid) ok(!M.isValidId(v), "id should be invalid: " + v)
+  for (const v of c.addrs.valid) ok(M.isValidAddr(v), "addr should be valid: " + v)
+  for (const v of c.addrs.invalid) ok(!M.isValidAddr(v), "addr should be invalid: " + v)
+  ok(c.settings.length > 0)
+  for (const s of c.settings) {
+    eq(M.validateSetting(s.key, s.value, s.scope).ok, s.ok, s.scope + " " + s.key + "=" + JSON.stringify(s.value))
+  }
+})
+
+// ------------------------------------------------------------------ new logic
+
+const U1 = "opendisplay-a0ec2343.service"
+const T1 = "od-sender@" + ID.replace(/-/g, "\\x2d") + ".service"
+const clone = (v) => JSON.parse(JSON.stringify(v))
+const mkSession = (o) => Object.assign({ output: "od-a0ec23", pid: 1, unit: "", id: "", to: "", since: 0 }, o)
+const mkUnit = (o) => Object.assign({ unit: U1, state: "active", template: false, id: "", to: "", status: 0, since: 0 }, o)
+const mkStatus = (o) => Object.assign({ ok: true, sessions: [], units: [], autoconnect: [], templateInstalled: true }, o)
+
+test("PRESET_NAMES derives from PRESETS", () => {
+  eq(M.PRESET_NAMES, ["sharp", "balanced", "light"])
+})
+
+test("buildSessions: live, reconnecting, connecting, waiting, pending, external id", () => {
+  const now = 1000000
+  const status = mkStatus({
+    sessions: [
+      mkSession({ unit: U1, id: ID }),
+      mkSession({ unit: T1, output: "od-beef00", id: "BEEF0000-0000-0000-0000-000000000001" }),
+      mkSession({ output: "od-cafe00" })
+    ],
+    units: [
+      mkUnit({ unit: "opendisplay-11111111.service", state: "activating", to: "x" }),
+      mkUnit({ unit: "od-sender@DDDD0000.service", template: true, id: "DDDD0000-0000" }),
+      mkUnit({ unit: "opendisplay-22222222.service", state: "failed" }),
+      mkUnit({ unit: "opendisplay-33333333.service", state: "deactivating" }),
+      mkUnit({ unit: U1 })
+    ]
+  })
+  const live = {
+    [U1]: { tailStartMs: now - 60000, lastLogMs: now - 1000, name: "iPad", fps: 58, mbps: 1.4, latency: 17, transport: "WiFi" },
+    [T1]: { tailStartMs: now - 60000, lastLogMs: now - 20000 }
+  }
+  const pending = {
+    [ID.toUpperCase()]: { id: ID, since: now },
+    "AAAA0000-0000": { id: "aaaa0000-0000", since: now }
+  }
+  const discovered = [{ id: "CAFE0000-0000-0000-0000-000000000009", name: "Mac", addr: "1.2.3.4:9000" }]
+  const known = []
+  const snap = clone([status, live, pending, discovered, known])
+  const r = M.buildSessions(status, live, pending, discovered, known, now)
+  eq(clone([status, live, pending, discovered, known]), snap)
+
+  eq(r[0], { key: U1, id: ID, unit: U1, output: "od-a0ec23", pid: 1, to: "", external: false, template: false,
+    name: "iPad", state: "live", fps: 58, mbps: 1.4, latency: 17, transport: "WiFi" })
+  eq(r[1].state, "reconnecting")
+  eq(r[1].template, true)
+  eq([r[1].fps, r[1].transport], [-1, ""])
+  eq([r[2].key, r[2].external, r[2].state, r[2].id], ["od-cafe00", true, "live", "CAFE0000-0000-0000-0000-000000000009"])
+  eq(r[3].state, "connecting")
+  eq(r[3].fps, -1)
+  eq([r[4].state, r[4].template, r[4].id], ["waiting", true, "DDDD0000-0000"])
+  eq(r.length, 6)
+  eq(r[5], { key: "pending:AAAA0000-0000", id: "aaaa0000-0000", unit: "", output: "", to: "", external: false,
+    template: false, name: "", state: "connecting", fps: -1, mbps: -1, latency: -1, transport: "" })
+})
+
+test("buildSessions: pending covered by a session (case-insensitive) is not added", () => {
+  const status = mkStatus({ sessions: [mkSession({ unit: U1, id: ID })] })
+  const r = M.buildSessions(status, {}, { [ID.toUpperCase()]: { id: ID.toLowerCase(), since: 0 } }, [], [], 0)
+  eq(r.length, 1)
+})
+
+test("reconcilePending: a live session or an auto-connect template resolves; a running transient unit is still connecting", () => {
+  const now = 100000
+  const pending = {
+    [ID]: { id: ID, since: now },
+    "BEEF0000-0000": { id: "BEEF0000-0000", since: now },
+    "CAFE0000-0000": { id: "CAFE0000-0000", since: now },
+    "DDDD0000-0000": { id: "DDDD0000-0000", since: now }
+  }
+  const status = mkStatus({
+    sessions: [mkSession({ id: ID })],
+    units: [
+      mkUnit({ id: "beef0000-0000", state: "activating" }),
+      mkUnit({ unit: "od-sender@DDDD0000\\x2d0000.service", id: "DDDD0000-0000", state: "active", template: true })
+    ]
+  })
+  const snap = clone([pending, status])
+  const r = M.reconcilePending(pending, {}, status, now)
+  eq(clone([pending, status]), snap)
+  eq(Object.keys(r.pending).sort(), ["BEEF0000-0000", "CAFE0000-0000"])
+  eq(r.failures, [])
+})
+
+test("reconcilePending: a connect that runs, then fails, is reported (regression)", () => {
+  const click = 500000
+  let pending = { [ID]: { id: ID, since: click } }
+  let r = M.reconcilePending(pending, {}, mkStatus({ units: [mkUnit({ id: ID, state: "active", since: click / 1000 })] }), click + 5000)
+  eq(Object.keys(r.pending), [ID])
+  r = M.reconcilePending(r.pending, {}, mkStatus({ units: [mkUnit({ id: ID, state: "failed", status: 3, since: click / 1000 })] }), click + 11000)
+  eq(r.failures, [{ unit: U1, status: 3, id: ID }])
+  // Still running long after the click: not dropped by the 30 s timeout.
+  r = M.reconcilePending(pending, {}, mkStatus({ units: [mkUnit({ id: ID, state: "active", since: click / 1000 })] }), click + 60000)
+  eq(Object.keys(r.pending), [ID])
+})
+
+test("reconcilePending: fresh failure reported, stale failure ignored", () => {
+  const click = 500000
+  const pending = { [ID]: { id: ID, since: click } }
+  const fresh = mkStatus({ units: [mkUnit({ id: ID, state: "failed", status: 3, since: click / 1000 })] })
+  const r = M.reconcilePending(pending, {}, fresh, click + 2000)
+  eq(r.failures, [{ unit: U1, status: 3, id: ID }])
+  eq(r.pending, {})
+  const stale = mkStatus({ units: [mkUnit({ id: ID, state: "failed", status: 3, since: click / 1000 - 60 })] })
+  const r2 = M.reconcilePending(pending, {}, stale, click + 2000)
+  eq(r2.failures, [])
+  eq(Object.keys(r2.pending), [ID])
+})
+
+test("reconcilePending: pendingUnits resolve, fail, stale, and time out", () => {
+  const click = 500000
+  const mk = (u) => mkStatus({ units: [u] })
+  let r = M.reconcilePending({}, { [U1]: click }, mk(mkUnit({ id: ID, state: "failed", status: 6, since: click / 1000 })), click + 1000)
+  eq(r.failures, [{ unit: U1, status: 6, id: ID }])
+  eq(r.pendingUnits, {})
+  r = M.reconcilePending({}, { [U1]: click }, mk(mkUnit({ state: "failed", since: 1 })), click + 1000)
+  eq(r.failures, [])
+  eq(r.pendingUnits, { [U1]: click })
+  // Running is still connecting, even past the timeout.
+  r = M.reconcilePending({}, { [U1]: click }, mk(mkUnit({ state: "active" })), click + 40000)
+  eq(r.pendingUnits, { [U1]: click })
+  r = M.reconcilePending({}, { [U1]: click }, mkStatus({ sessions: [mkSession({ unit: U1 })] }), click + 1000)
+  eq(r.pendingUnits, {})
+  const units = { [U1]: click }
+  r = M.reconcilePending({}, units, mkStatus(), click + 31000)
+  eq(r.pendingUnits, {})
+  eq(units, { [U1]: click })
+})
+
+test("reconcilePending: nothing matching drops after 30 s only", () => {
+  const pending = { [ID]: { id: ID, since: 1000 } }
+  eq(Object.keys(M.reconcilePending(pending, {}, mkStatus(), 31000).pending), [ID])
+  eq(M.reconcilePending(pending, {}, mkStatus(), 31001).pending, {})
+  eq(pending, { [ID]: { id: ID, since: 1000 } })
+})
+
+const line = (rest) => M.parseLogLine("2026-11-09T12:00:00.000Z  INFO " + rest)
+const TS = Date.parse("2026-11-09T12:00:00.000Z")
+
+test("reduceLive: stats, phone, hello, ended, error", () => {
+  const e0 = { tailStartMs: 1 }
+  let r = M.reduceLive(e0, line("sent 58.6 fps 1.4 Mbit/s"), 500, { historic: false, tailStartMs: 1 })
+  eq([r.entry.fps, r.entry.mbps, r.entry.lastLogMs, r.entry.lastLogTs], [58.6, 1.4, 500, TS])
+  eq(e0, { tailStartMs: 1 })
+  eq(r.effects, { needStatus: false, used: null, notifyConnected: false })
+  r = M.reduceLive(r.entry, line('PHONE-STATS {"e2e50":17,"transport":"WiFi"}'), 600, { historic: false })
+  eq([r.entry.latency, r.entry.transport], [17, "WiFi"])
+  r = M.reduceLive(r.entry, line('PHONE-STATS {"e2e50":-5,"transport":""}'), 700, { historic: false })
+  eq([r.entry.latency, r.entry.transport], [17, "WiFi"])
+  r = M.reduceLive(undefined, line('hello: 1x1 @60 scale 2 device Some("iPad") id Some("' + ID + '") pv 3'), 800, { historic: false })
+  eq([r.entry.name, r.entry.id], ["iPad", ID])
+  r = M.reduceLive(r.entry, line("connection ended"), 900, { historic: false })
+  eq(r.effects.needStatus, true)
+  r = M.reduceLive(r.entry, M.parseLogLine("2026-11-09T12:00:00.000Z ERROR boom"), 900, { historic: false })
+  eq(r.entry.lastError, "boom")
+})
+
+test("reduceLive: connected clears stats and wants status", () => {
+  const e = { fps: 1, mbps: 2, latency: 3, transport: "USB" }
+  const r = M.reduceLive(e, line("connected to receiver 10.0.0.2:9000"), 10, { historic: false })
+  eq(r.entry.addr, "10.0.0.2:9000")
+  ok(!("fps" in r.entry) && !("mbps" in r.entry) && !("latency" in r.entry))
+  eq(r.entry.transport, "USB")
+  eq(r.effects.needStatus, true)
+  eq(e.fps, 1)
+})
+
+test("reduceLive: extending notifies only for lines written after the tail started", () => {
+  const ext = line("Extending onto iPad (" + ID + "):")
+  const base = { addr: "1.2.3.4:9000" }
+  let r = M.reduceLive(base, ext, 99, { historic: false, tailStartMs: TS - 1000 })
+  eq(r.effects.notifyConnected, true)
+  eq(r.effects.needStatus, true)
+  eq(r.effects.used, { id: ID, name: "iPad", addr: "1.2.3.4:9000", ts: TS })
+  r = M.reduceLive(base, ext, 99, { historic: false, tailStartMs: TS + 2000 })
+  eq(r.effects.notifyConnected, true)
+  r = M.reduceLive(base, ext, 99, { historic: false, tailStartMs: TS + 5000 })
+  eq(r.effects.notifyConnected, false)
+  r = M.reduceLive(base, ext, 99, { historic: false, tailStartMs: TS + 2001 })
+  eq(r.effects.notifyConnected, false)
+})
+
+test("reduceLive: historic is identity only", () => {
+  const ext = line("Extending onto iPad (" + ID + "):")
+  const r = M.reduceLive({ lastLogMs: 5, lastLogTs: 6, fps: 9 }, ext, 99, { historic: true, tailStartMs: 0 })
+  eq([r.entry.lastLogMs, r.entry.lastLogTs, r.entry.fps], [5, 6, 9])
+  eq([r.entry.name, r.entry.id], ["iPad", ID])
+  eq(r.effects.notifyConnected, false)
+  eq(r.effects.needStatus, false)
+  eq(r.effects.used.ts, TS)
+  const c = M.reduceLive({ addr: "keep" }, line("connected to receiver 10.0.0.2:9000"), 1, { historic: true })
+  eq(c.entry.addr, "keep")
+  const h = M.reduceLive({ name: "old" }, line('hello: 1x1 @60 scale 2 device Some("New") id Some("' + ID + '") pv 3'), 1, { historic: true })
+  eq([h.entry.name, h.entry.id, h.entry.lastLogMs], ["old", ID, undefined])
+  eq(M.reduceLive({}, M.parseLogLine("Started"), 7, { historic: true }).effects.used, null)
+})
+
+test("notification keys dedupe by journal timestamp, not local clock", () => {
+  eq(M.droppedNotificationKey(T1, { lastLogMs: 1, lastLogTs: 77 }), M.droppedNotificationKey(T1, { lastLogMs: 999, lastLogTs: 77 }))
+  eq(M.droppedNotificationKey(T1, undefined), "dropped:" + T1 + ":0")
+  eq(M.connectedNotificationKey(T1, 5), "connected:" + T1 + ":5")
+})
+
+test("signatures ignore stats but track structure", () => {
+  const card = { key: "k", id: ID, name: "iPad", state: "live", autoConnect: false, external: false, template: true, unit: T1, output: "o", fps: 1, mbps: 1, latency: 1, transport: "USB" }
+  const same = Object.assign({}, card, { fps: 60, mbps: 9, latency: 30, transport: "WiFi" })
+  eq(M.cardsSignature([card]), M.cardsSignature([same]))
+  ok(M.cardsSignature([card]) !== M.cardsSignature([Object.assign({}, card, { state: "reconnecting" })]))
+  const other = { key: "k", id: ID, name: "n", addr: "a", state: "idle", autoConnect: false, lastUsedDays: 1, unit: "", fps: 1 }
+  eq(M.othersSignature([other]), M.othersSignature([Object.assign({}, other, { fps: 2 })]))
+  ok(M.othersSignature([other]) !== M.othersSignature([Object.assign({}, other, { state: "paused" })]))
+  ok(M.othersSignature([other]) !== M.othersSignature([Object.assign({}, other, { lastUsedDays: 2 })]))
+})
+
+test("scaleChange passthrough depends on the top-level scale", () => {
+  eq(M.scaleChange({}, ID, "passthrough"), { key: "scale", value: "" })
+  eq(M.scaleChange({ scale: "passthrough" }, ID, "passthrough"), { key: "scale", value: "" })
+  eq(M.scaleChange({ scale: 2 }, ID, "passthrough"), { key: "scale", value: "passthrough" })
+  eq(M.scaleChange({ scale: 2 }, ID, "1.5"), { key: "scale", value: "1.5" })
+  eq(M.scaleChange({}, ID, 2), { key: "scale", value: "2" })
+})
+
+test("helperError maps exit codes to i18n keys", () => {
+  const want = { 2: ["error.invalidValue", false], 5: ["error.cantRun", true], 6: ["error.rejected", true], 7: ["error.autoConnectUnit", false],
+    8: ["error.notInstalled", false], 9: ["error.externalSender", false], 10: ["error.packageManaged", false], 11: ["error.offline", false] }
+  for (const code of Object.keys(want)) eq(M.helperError(Number(code)), { key: want[code][0], doctor: want[code][1] })
+  eq(M.helperError(1), { key: "", doctor: false })
+  eq(M.helperError(undefined), { key: "", doctor: false })
+})
+
+test("shouldRemember skips only an up-to-date entry", () => {
+  const known = [{ id: ID, name: "iPad", lastAddr: "", lastUsed: 100 }]
+  eq(M.shouldRemember(known, ID, "iPad", 100), false)
+  eq(M.shouldRemember(known, ID, "", 50), false)
+  eq(M.shouldRemember(known, ID, "iPad", 101), true)
+  eq(M.shouldRemember(known, ID, "Renamed", 100), true)
+  eq(M.shouldRemember(known, "deadbeef", "x", 1), true)
+  eq(M.shouldRemember([], ID, "", 0), true)
+})
+
+test("mergeReceivers: auto-connect offline is paused unless a waiting session exists", () => {
+  const MAC = "CAFE0000-0000-0000-0000-000000000002"
+  const r = M.mergeReceivers([], [], [], [MAC], 0)
+  eq(r.others.map(o => [o.state, o.autoConnect]), [["paused", true]])
+  const w = M.mergeReceivers([], [], [{ key: T1, id: MAC, unit: T1, state: "waiting" }], [MAC], 0)
+  eq(w.others.map(o => [o.state, o.autoConnect]), [["waiting", true]])
+  const online = M.mergeReceivers([{ id: MAC, name: "Mac", addr: "1.2.3.4:9000" }], [], [], [MAC], 0)
+  eq(online.others[0].state, "idle")
+  eq(online.others[0].autoConnect, true)
+})
+
 // ------------------------------------------------------------------ sinks
 
 test("bar label: name truncated at 12, count for 2+, markup kept as text", () => {
@@ -341,16 +604,45 @@ test("notification bodies escape markup; everything else stays raw", () => {
   eq(M.clampText(MARKUP, 64), MARKUP)
 })
 
-test("QML sinks: every Text in the plugin is PlainText", () => {
+function textBlocks(src) {
+  // Returns { line, body } for each Text block; body has nested blocks removed.
+  const lines = src.split("\n")
+  const out = []
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\s*(component\s+\w+\s*:\s*)?Text\s*\{/.test(lines[i])) continue
+    let depth = 0
+    let own = ""
+    for (let j = i; j < lines.length; j++) {
+      const text = j === i ? lines[i].slice(lines[i].indexOf("Text")) : lines[j]
+      const code = text.replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/\/\/.*$/, "")
+      for (const ch of code) {
+        if (ch === "{") depth++
+        else if (ch === "}") depth--
+        else if (depth === 1) own += ch
+      }
+      if (depth === 1) own += "\n"
+      if (depth <= 0) break
+    }
+    out.push({ line: i + 1, body: own })
+  }
+  return out
+}
+
+test("QML sinks: every Text block sets PlainText at its own top level", () => {
   for (const file of fs.readdirSync(root).filter(f => f.endsWith(".qml"))) {
     const src = fs.readFileSync(path.join(root, file), "utf8")
-    const texts = src.match(/^\s*(Text|PlainText)\s*\{/gm) || []
-    const plain = src.match(/textFormat:\s*Text\.PlainText/g) || []
-    // PlainText components set the format once in their definition.
-    const custom = (src.match(/^\s*PlainText\s*\{/gm) || []).length
-    ok(plain.length >= texts.length - custom, file + ": " + texts.length + " Text items, " + plain.length + " PlainText")
+    for (const b of textBlocks(src)) {
+      ok(/textFormat:\s*Text\.PlainText/.test(b.body), file + ":" + b.line + " Text block lacks textFormat: Text.PlainText")
+    }
     ok(!/Text\.(RichText|StyledText|AutoText|MarkdownText)/.test(src), file + " uses a rich text format")
   }
+})
+
+test("textBlocks ignores PlainText set only in a nested child", () => {
+  const bad = "Text {\n  Text {\n    textFormat: Text.PlainText\n  }\n}\n"
+  const good = "Text {\n  textFormat: Text.PlainText\n  Text {\n    x: 1\n  }\n}\n"
+  ok(!/Text\.PlainText/.test(textBlocks(bad)[0].body))
+  ok(/Text\.PlainText/.test(textBlocks(good)[0].body))
 })
 
 test("rate formatting", () => {

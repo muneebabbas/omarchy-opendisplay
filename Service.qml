@@ -44,11 +44,22 @@ Item {
   property var discovered: []
   property var status: ({ ok: false, sessions: [], units: [], autoconnect: [], templateInstalled: false })
   property var config: ({})
+  // `cards` and `others` are reassigned only when their structure changes, so
+  // the panel's delegates survive a stats tick; live numbers are in `stats`.
   property var cards: []
   property var others: []
+  property var stats: ({})
   property var connectingNames: []
-  readonly property bool anyActive: cards.length > 0 || connectingNames.length > 0 || tailUnits.length > 0
-  readonly property bool busy: _current !== null || installProc.running
+  // A waiting auto-connect template alone is not a reason to poll every 5 s.
+  readonly property bool hasRunningSession: {
+    var units = status.units || []
+    for (var i = 0; i < units.length; i++) {
+      if (!units[i].template && (units[i].state === "active" || units[i].state === "activating")) return true
+    }
+    return false
+  }
+  readonly property bool anyActive: cards.length > 0 || connectingNames.length > 0 || hasRunningSession
+  readonly property bool busy: actions.busy || installProc.pending
 
   // --- errors: a translation key (+ arg) or raw untrusted text, rendered plain
   property string errorKey: ""
@@ -64,11 +75,16 @@ Item {
   property var _pending: ({})
   property var _pendingUnits: ({})
   property var _droppedNotified: ({})
-  property var _queue: []
-  property var _current: null
+  property string _cardsSig: ""
+  property string _othersSig: ""
+  property string _statsSig: ""
+  property string _connectingSig: "[]"
+  // JS mirror of tailModel's units, for lookups.
   property var tailUnits: []
   property string _tailSig: "[]"
-  readonly property double startedMs: Date.now()
+  // Where the helper stamps every change, so other monitors' copies of this
+  // widget refresh too. Set once the first status call has succeeded.
+  property string stampPath: ""
 
   function setting(name, fallback) {
     var value = settings ? settings[name] : undefined
@@ -108,65 +124,60 @@ Item {
     return ""
   }
 
-  // Known helper messages get translated; anything else is shown as-is.
-  function errorFromHelper(text) {
-    var line = lastLine(text)
-    if (/rejected the setting/.test(line)) setError("error.rejected", "", true)
-    else if (/Auto-connect needs the od-sender systemd unit/.test(line)) setError("error.autoConnectUnit")
-    else if (/invalid address/.test(line)) setError("error.invalidAddr")
-    else setRawError(line)
+  // The helper's exit code picks the message; only an unmapped failure shows
+  // its own last stderr line (raw, untrusted).
+  function handleHelperError(code, out, err) {
+    var e = Model.helperError(code)
+    if (e.key !== "") { setError(e.key, "", e.doctor); return }
+    var line = lastLine(err)
+    setRawError(line !== "" ? line : lastLine(out))
   }
 
-  // ------------------------------------------------------------ action queue
-
-  // Helper commands run one at a time, in order, so a preset click followed by
-  // a restart can't race. `done(exitCode, stdout, stderr)` runs afterwards.
-  function enqueue(args, done) {
-    var q = _queue.slice()
-    q.push({ command: [helperPath].concat(args), done: done || null })
-    _queue = q
-    pump()
+  function forgetPending(id) {
+    var key = String(id || "").toUpperCase()
+    if (key === "" || !_pending[key]) return
+    var next = {}
+    for (var k in _pending) if (k !== key) next[k] = _pending[k]
+    _pending = next
   }
 
-  function pump() {
-    // _current stays set until its result is handled, which can be a moment
-    // after the process itself has exited.
-    if (_current !== null || _queue.length === 0) return
-    var q = _queue.slice()
-    _current = q.shift()
-    _queue = q
-    actionProc.command = _current.command
-    actionProc.running = true
+  function forgetPendingUnit(unit) {
+    if (_pendingUnits[unit] === undefined) return
+    var next = {}
+    for (var k in _pendingUnits) if (k !== unit) next[k] = _pendingUnits[k]
+    _pendingUnits = next
   }
 
   // ------------------------------------------------------------ refresh
 
   function refreshStatus() {
-    if (statusProc.running) { statusDebounce.restart(); return }
+    if (statusProc.pending) { statusDebounce.restart(); return }
     statusProc.running = true
   }
 
   function scheduleStatus() { statusDebounce.restart() }
 
   function refreshVersion() {
-    if (!versionProc.running) versionProc.running = true
+    if (!versionProc.pending) versionProc.running = true
   }
 
   function refreshConfig() {
-    if (!configProc.running) configProc.running = true
+    if (!configProc.pending) configProc.running = true
   }
 
   function scan() {
-    if (!installed || scanProc.running) return
+    if (!installed || scanProc.pending) return
     scanning = true
     scanProc.running = true
   }
 
   function checkUpdate(force) {
-    if (updateProc.running) return
+    if (updateProc.pending) return
     // The first-run card needs the release; otherwise honor the setting.
     if (installed && !checkUpdates && force !== true) return
     lastUpdateCheckMs = Date.now()
+    // Without --force the helper answers from its cache when it is under 6 h old.
+    updateProc.command = force === true ? [helperPath, "check-update", "--force"] : [helperPath, "check-update"]
     updateProc.running = true
   }
 
@@ -182,75 +193,46 @@ Item {
 
   // ------------------------------------------------------------ sessions
 
-  function liveFor(unit) {
-    return _live[unit] || null
-  }
-
   function rebuild() {
     var now = Date.now()
-    var sessions = []
-    var seenUnits = {}
-    var connecting = []
-
-    for (var i = 0; i < status.sessions.length; i++) {
-      var s = status.sessions[i]
-      var key = s.unit !== "" ? s.unit : s.output
-      var live = liveFor(key) || {}
-      var id = s.id || live.id || Model.idForOutput(s.output, discovered, knownReceivers)
-      var state = "live"
-      if (s.unit !== "" && live.tailStartMs && now - Math.max(live.tailStartMs, live.lastLogMs || 0) > 15000) state = "reconnecting"
-      if (s.unit !== "") seenUnits[s.unit] = true
-      sessions.push({
-        key: key, id: id, unit: s.unit, output: s.output, pid: s.pid, to: s.to,
-        external: s.unit === "", template: s.unit.indexOf("od-sender@") === 0,
-        name: live.name || "", state: state,
-        fps: live.fps === undefined ? -1 : live.fps,
-        mbps: live.mbps === undefined ? -1 : live.mbps,
-        latency: live.latency === undefined ? -1 : live.latency,
-        transport: live.transport || ""
-      })
-      if (id !== "") delete _pending[id.toUpperCase()]
-      if (s.unit !== "") delete _pendingUnits[s.unit]
-    }
-
-    for (var j = 0; j < status.units.length; j++) {
-      var u = status.units[j]
-      if (seenUnits[u.unit] || u.state === "failed" || u.state === "deactivating") continue
-      var ul = liveFor(u.unit) || {}
-      var uid = u.id || ul.id || ""
-      sessions.push({
-        key: u.unit, id: uid, unit: u.unit, output: "", to: u.to, external: false, template: u.template,
-        name: ul.name || "", state: u.template ? "waiting" : "connecting"
-      })
-      seenUnits[u.unit] = true
-    }
-
-    // Pressed Connect, but status hasn't seen the unit yet.
-    for (var pid in _pending) {
-      var found = false
-      for (var k = 0; k < sessions.length; k++) if (sessions[k].id !== "" && sessions[k].id.toUpperCase() === pid) found = true
-      if (!found) sessions.push({ key: "pending:" + pid, id: _pending[pid].id, unit: "", state: "connecting", name: "" })
-    }
-
+    var sessions = Model.buildSessions(status, _live, _pending, discovered, knownReceivers, now)
     var merged = Model.mergeReceivers(discovered, knownReceivers, sessions, status.autoconnect, now)
+
+    var connecting = []
     for (var m = 0; m < merged.others.length; m++) {
       if (merged.others[m].state === "connecting") connecting.push(merged.others[m].name)
     }
-    cards = merged.cards
-    others = merged.others
-    connectingNames = connecting
-    checkDropped(now)
+    var live = {}
+    for (var c = 0; c < merged.cards.length; c++) {
+      var card = merged.cards[c]
+      live[card.key] = {
+        fps: card.fps === undefined ? -1 : card.fps,
+        mbps: card.mbps === undefined ? -1 : card.mbps,
+        latency: card.latency === undefined ? -1 : card.latency,
+        transport: card.transport || ""
+      }
+    }
+
+    var cardsSig = Model.cardsSignature(merged.cards)
+    if (cardsSig !== _cardsSig) { _cardsSig = cardsSig; cards = merged.cards }
+    var othersSig = Model.othersSignature(merged.others)
+    if (othersSig !== _othersSig) { _othersSig = othersSig; others = merged.others }
+    var statsSig = JSON.stringify(live)
+    if (statsSig !== _statsSig) { _statsSig = statsSig; stats = live }
+    var connectingSig = JSON.stringify(connecting)
+    if (connectingSig !== _connectingSig) { _connectingSig = connectingSig; connectingNames = connecting }
   }
 
+  // Called from the 5 s timer, never from rebuild().
   function checkDropped(now) {
     for (var i = 0; i < cards.length; i++) {
       var c = cards[i]
       if (!c.template) continue
-      var live = liveFor(c.unit) || {}
+      var live = _live[c.unit] || {}
       var quiet = now - Math.max(live.tailStartMs || now, live.lastLogMs || 0)
       if (quiet > 30000 && !_droppedNotified[c.unit]) {
         _droppedNotified[c.unit] = true
-        notify(t("notify.dropped").arg(c.name), "dropped:" + c.unit + ":" + (live.lastLogMs || 0))
+        notify(t("notify.dropped").arg(c.name), Model.droppedNotificationKey(c.unit, _live[c.unit]))
       } else if (quiet < 15000) {
         delete _droppedNotified[c.unit]
       }
@@ -260,34 +242,10 @@ Item {
   function applyStatus(raw) {
     var parsed = Model.parseStatus(raw)
     if (!parsed.ok) return
-    // A connect whose unit has failed: map the exit code to a message.
-    for (var i = 0; i < parsed.units.length; i++) {
-      var u = parsed.units[i]
-      if (u.state !== "failed") continue
-      var pendingId = u.id && _pending[u.id.toUpperCase()] ? u.id.toUpperCase() : ""
-      if (pendingId === "" && !_pendingUnits[u.unit]) {
-        // The id lives in the unit description only for template units; a
-        // transient unit named after a pending id counts too.
-        for (var p in _pending) if (Model.transientUnitForId(_pending[p].id) === u.unit) pendingId = p
-      }
-      if (pendingId === "" && !_pendingUnits[u.unit]) continue
-      if (pendingId !== "") delete _pending[pendingId]
-      delete _pendingUnits[u.unit]
-      reportConnectFailure(u.unit, u.status)
-    }
-    // Pending entries that went nowhere (unit gone without failing).
-    var now = Date.now()
-    for (var p2 in _pending) {
-      var unitName = Model.transientUnitForId(_pending[p2].id)
-      var still = false
-      for (var j = 0; j < parsed.units.length; j++) if (parsed.units[j].unit === unitName || Model.sameId(parsed.units[j].id, _pending[p2].id)) still = true
-      if (!still && now - _pending[p2].since > 4000) delete _pending[p2]
-    }
-    for (var pu in _pendingUnits) {
-      var exists = false
-      for (var k = 0; k < parsed.units.length; k++) if (parsed.units[k].unit === pu) exists = true
-      if (!exists && now - _pendingUnits[pu] > 4000) delete _pendingUnits[pu]
-    }
+    var r = Model.reconcilePending(_pending, _pendingUnits, parsed, Date.now())
+    _pending = r.pending
+    _pendingUnits = r.pendingUnits
+    for (var i = 0; i < r.failures.length; i++) reportConnectFailure(r.failures[i].unit, r.failures[i].status)
     status = parsed
     syncTails()
     rebuild()
@@ -298,18 +256,20 @@ Item {
     if (kind === "notFound") setError("error.notFound")
     else if (kind === "badConfig") setError("error.badConfig", "", true)
     else {
-      var live = liveFor(unit)
+      var live = _live[unit]
       if (live && live.lastError) setRawError(live.lastError)
-      else enqueue(["last-error", unit], function(code2, out) {
+      else lookups.enqueue(["last-error", unit], function(code2, out) {
         var r = Model.parseLogLine(lastLine(out))
         if (r && r.kind === "error") setRawError(r.text)
         else setError("error.commandFailed")
       })
     }
-    // Reported; clear the failed unit (the queue runs after last-error).
-    enqueue(["disconnect", unit], function() { scheduleStatus() })
+    // Reported; clear the failed unit.
+    actions.enqueue(["disconnect", unit], function() { scheduleStatus() })
   }
 
+  // One log tail per active unit. tailModel is diffed in place: handing the
+  // Instantiator a fresh array would restart every tail whenever the set changed.
   function syncTails() {
     var units = []
     for (var i = 0; i < status.units.length; i++) {
@@ -324,7 +284,15 @@ Item {
     var next = {}
     for (var k in _live) if (units.indexOf(k) !== -1) next[k] = _live[k]
     _live = next
+    // Before the model changes, so a new tail's first lines are accepted.
     tailUnits = units
+    var have = {}
+    for (var r = tailModel.count - 1; r >= 0; r--) {
+      var unit = tailModel.get(r).unit
+      if (units.indexOf(unit) === -1) tailModel.remove(r)
+      else have[unit] = true
+    }
+    for (var n = 0; n < units.length; n++) if (!have[units[n]]) tailModel.append({ unit: units[n] })
   }
 
   function tailStarted(unit) {
@@ -333,59 +301,29 @@ Item {
     _live[unit] = l
     // The tail replays only recent lines; fetch the session's opening lines
     // once for the receiver's name, id and address.
-    enqueue(["first-lines", unit], function(code, out) {
+    lookups.enqueue(["first-lines", unit], function(code, out) {
       var lines = String(out || "").split("\n")
       for (var i = 0; i < lines.length; i++) if (lines[i] !== "") root.handleLog(unit, lines[i], true)
     })
   }
 
   function handleLog(unit, line, historic) {
-    var r = Model.parseLogLine(line)
-    if (!r) return
-    if (tailUnits.indexOf(unit) === -1) return
-    var l = _live[unit] || { tailStartMs: Date.now() }
-    if (historic === true) {
-      // Identity only; never resets stats or counts as activity.
-      if (r.kind === "connected" && !l.addr) l.addr = r.addr
-      if ((r.kind === "hello" || r.kind === "extending") && r.name !== "" && !l.name) l.name = r.name
-      if ((r.kind === "hello" || r.kind === "extending") && r.id !== "" && !l.id) l.id = r.id
-      if (r.kind === "extending" && l.id) receiverUsed(l.id, l.name || "", l.addr || "", r.ts > 0 ? r.ts : Date.now())
-      _live[unit] = l
-      rebuildThrottle.start()
-      return
+    var parsed = Model.parseLogLine(line)
+    if (!parsed || tailUnits.indexOf(unit) === -1) return
+    var now = Date.now()
+    var cur = _live[unit]
+    var res = Model.reduceLive(cur, parsed, now, { historic: historic === true, tailStartMs: (cur || {}).tailStartMs || now })
+    _live[unit] = res.entry
+    var fx = res.effects
+    if (fx.needStatus) scheduleStatus()
+    if (fx.used) {
+      forgetPending(fx.used.id)
+      receiverUsed(fx.used.id, fx.used.name, fx.used.addr, fx.used.ts)
     }
-    l.lastLogMs = Date.now()
-    var fresh = r.ts > 0 && r.ts >= startedMs - 2000
-    var needStatus = false
-    if (r.kind === "sent") { l.fps = r.fps; l.mbps = r.mbps }
-    else if (r.kind === "phone") {
-      if (r.e2e50 >= 0) l.latency = r.e2e50
-      if (r.transport !== "") l.transport = r.transport
-    } else if (r.kind === "connected") {
-      l.addr = r.addr
-      l.fps = undefined; l.mbps = undefined; l.latency = undefined
-      needStatus = true
-    } else if (r.kind === "hello") {
-      if (r.name !== "") l.name = r.name
-      if (r.id !== "") l.id = r.id
-    } else if (r.kind === "extending") {
-      if (r.name !== "") l.name = r.name
-      if (r.id !== "") l.id = r.id
-      needStatus = true
-      var id = l.id || ""
-      if (id !== "") {
-        delete _pending[id.toUpperCase()]
-        receiverUsed(id, l.name || "", l.addr || "", r.ts > 0 ? r.ts : Date.now())
-      }
-      delete _pendingUnits[unit]
-      if (fresh && unit.indexOf("od-sender@") === 0) notify(t("notify.connected").arg(l.name || id), "connected:" + unit + ":" + r.ts)
-    } else if (r.kind === "ended") {
-      needStatus = true
-    } else if (r.kind === "error") {
-      l.lastError = r.text
+    if (parsed.kind === "extending" && historic !== true) forgetPendingUnit(unit)
+    if (fx.notifyConnected && unit.indexOf("od-sender@") === 0) {
+      notify(t("notify.connected").arg(res.entry.name || res.entry.id || ""), Model.connectedNotificationKey(unit, parsed.ts))
     }
-    _live[unit] = l
-    if (needStatus) scheduleStatus()
     rebuildThrottle.start()
   }
 
@@ -394,14 +332,16 @@ Item {
   function connect(id) {
     if (!Model.isValidId(id)) return false
     clearError()
-    var p = _pending
+    var p = {}
+    for (var k in _pending) p[k] = _pending[k]
     p[id.toUpperCase()] = { id: id, since: Date.now() }
     _pending = p
     rebuild()
-    enqueue(["connect", id], function(code, out, err) {
+    actions.enqueue(["connect", id], function(code, out, err) {
       if (code !== 0) {
-        delete _pending[id.toUpperCase()]
-        errorFromHelper(err || out)
+        forgetPending(id)
+        handleHelperError(code, out, err)
+        rebuild()
       }
       scheduleStatus()
     })
@@ -412,22 +352,21 @@ Item {
     var a = String(addr || "").trim()
     if (!Model.isValidAddr(a)) { setError("error.invalidAddr"); return false }
     clearError()
-    enqueue(["connect-addr", a], function(code, out, err) {
-      if (code !== 0) errorFromHelper(err || out)
+    actions.enqueue(["connect-addr", a], function(code, out, err) {
+      if (code !== 0) handleHelperError(code, out, err)
       else {
         var unit = lastLine(out)
-        if (Model.isValidUnit(unit)) _pendingUnits[unit] = Date.now()
+        if (Model.isValidUnit(unit)) {
+          var pu = {}
+          for (var k in _pendingUnits) pu[k] = _pendingUnits[k]
+          pu[unit] = Date.now()
+          _pendingUnits = pu
+          rebuild()
+        }
       }
       scheduleStatus()
     })
     return true
-  }
-
-  function connectLast() {
-    var last = Model.lastUsedReceiver(knownReceivers)
-    if (!last) { notify(t("error.noRecent"), "norecent"); return "no recent receiver" }
-    connect(last.id)
-    return "connecting " + last.name
   }
 
   function targetFor(card) {
@@ -442,23 +381,47 @@ Item {
     var t2 = String(target || "")
     if (t2 === "") return
     clearError()
-    if (Model.isValidId(t2)) delete _pending[t2.toUpperCase()]
-    enqueue(["disconnect", t2], function(code, out, err) {
-      if (code !== 0) errorFromHelper(err || out)
+    if (Model.isValidId(t2)) forgetPending(t2)
+    actions.enqueue(["disconnect", t2], function(code, out, err) {
+      if (code !== 0) handleHelperError(code, out, err)
       scheduleStatus()
     })
   }
 
+  // Everything running, plus connects that haven't shown up in status yet.
   function disconnectAll() {
     var targets = []
-    for (var i = 0; i < cards.length; i++) targets.push(targetFor(cards[i]))
+    function add(target) { if (target !== "" && targets.indexOf(target) === -1) targets.push(target) }
+    for (var i = 0; i < cards.length; i++) add(targetFor(cards[i]))
     for (var j = 0; j < status.units.length; j++) {
       var u = status.units[j]
-      if (!u.template && (u.state === "active" || u.state === "activating") && targets.indexOf(u.unit) === -1) targets.push(u.unit)
+      if (!u.template && (u.state === "active" || u.state === "activating")) add(u.unit)
     }
+    for (var p in _pending) add(_pending[p].id || p)
+    for (var pu in _pendingUnits) add(pu)
     _pending = ({})
-    for (var k = 0; k < targets.length; k++) if (targets[k] !== "") disconnect(targets[k])
+    _pendingUnits = ({})
+    for (var k = 0; k < targets.length; k++) disconnect(targets[k])
+    rebuild()
     return targets.length
+  }
+
+  // Bar right-click: stop everything, or reconnect the last receiver. The
+  // panel turns the result into a message.
+  function toggleLast() {
+    if (!installed) return "notinstalled"
+    if (cards.length > 0 || connectingNames.length > 0) { disconnectAll(); return "disconnected" }
+    var last = Model.lastUsedReceiver(knownReceivers)
+    if (!last) return "none"
+    // By id only: it streams the desktop, so never jump to a lookalike name.
+    var online = false
+    for (var i = 0; i < others.length; i++) {
+      var o = others[i]
+      if (Model.sameId(o.id, last.id) && o.state !== "waiting" && o.state !== "paused") online = true
+    }
+    if (!online && scanned) return "missing"
+    connect(last.id)
+    return "connecting"
   }
 
   function cardForId(id) {
@@ -469,8 +432,8 @@ Item {
   function restartCard(card) {
     var target = card.unit !== "" ? card.unit : card.id
     if (target === "") return
-    enqueue(["restart", target], function(code, out, err) {
-      if (code !== 0) errorFromHelper(err || out)
+    actions.enqueue(["restart", target], function(code, out, err) {
+      if (code !== 0) handleHelperError(code, out, err)
       scheduleStatus()
     })
   }
@@ -498,12 +461,12 @@ Item {
     args.push(key + "=" + value)
     clearError()
     applyConfigLocally(receiverId, key, value)
-    enqueue(args, function(code, out, err) {
+    actions.enqueue(args, function(code, out, err) {
       if (code === 0 || code === 5) {
         if (code === 5) setError("error.cantRun", "", true)
         for (var i = 0; i < restartTargets.length; i++) restartCard(restartTargets[i])
       } else {
-        errorFromHelper(err || out)
+        handleHelperError(code, out, err)
       }
       refreshConfig()
     })
@@ -516,6 +479,11 @@ Item {
     var card = cardForId(id)
     writeConfig(id, key, v.value, card ? [card] : [])
     return true
+  }
+
+  function setScale(id, value) {
+    var change = Model.scaleChange(config, id, value)
+    return setReceiverOption(id, change.key, change.value)
   }
 
   function setPreset(id, name) {
@@ -535,14 +503,14 @@ Item {
     if (!Model.isValidId(id)) return
     clearError()
     if (on && !status.templateInstalled) { setError("error.autoConnectUnit"); return }
-    enqueue(["autoconnect", id, on ? "on" : "off"], function(code, out, err) {
-      if (code !== 0) errorFromHelper(err || out)
+    actions.enqueue(["autoconnect", id, on ? "on" : "off"], function(code, out, err) {
+      if (code !== 0) handleHelperError(code, out, err)
       scheduleStatus()
     })
   }
 
   function installOrUpdate() {
-    if (installProc.running || managed === "package") return
+    if (installProc.pending || managed === "package") return
     clearError()
     updateState = "updating"
     updateMessage = ""
@@ -569,7 +537,8 @@ Item {
     if (cards.length > 1) return "Extending onto " + cards.length + " displays"
     if (cards.length === 1) {
       var c = cards[0]
-      return "Extending onto " + c.name + (c.state === "reconnecting" ? " (reconnecting)" : (c.fps >= 0 ? " · " + Model.formatRate(c.fps) + " fps" : ""))
+      var fps = (stats[c.key] || {}).fps
+      return "Extending onto " + c.name + (c.state === "reconnecting" ? " (reconnecting)" : (fps >= 0 ? " · " + Model.formatRate(fps) + " fps" : ""))
     }
     if (connectingNames.length > 0) return "Connecting to " + connectingNames[0]
     return "Not connected"
@@ -603,7 +572,7 @@ Item {
     interval: 5000
     repeat: true
     running: root.cards.length > 0
-    onTriggered: root.rebuild()
+    onTriggered: { root.rebuild(); root.checkDropped(Date.now()) }
   }
 
   Timer {
@@ -650,17 +619,66 @@ Item {
     property bool _errDone: false
     property string _out: ""
     property string _err: ""
+    // True from start until the result has been delivered, which is later than
+    // `running` going false; guards check this instead of `running`.
+    property bool pending: false
     function _maybe() {
       if (_code < 0 || !_outDone || !_errDone) return
       var c = _code
       _code = -1
+      pending = false
       finished(c, _out, _err)
     }
-    onRunningChanged: if (running) { _code = -1; _outDone = false; _errDone = false; _out = ""; _err = "" }
+    onRunningChanged: if (running) { pending = true; _code = -1; _outDone = false; _errDone = false; _out = ""; _err = "" }
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: { job._out = text; job._outDone = true; job._maybe() } }
     stderr: StdioCollector { waitForEnd: true; onStreamFinished: { job._err = text; job._errDone = true; job._maybe() } }
     onExited: function(code) { job._code = code; job._maybe() }
   }
+
+  // Runs helper commands one at a time, in order, so a preset click followed
+  // by a restart can't race. `done(exitCode, stdout, stderr)` runs afterwards.
+  component HelperQueue: Item {
+    id: queue
+    property var _queue: []
+    property var _current: null
+    readonly property bool busy: _current !== null
+
+    function enqueue(args, done) {
+      var q = _queue.slice()
+      q.push({ command: [root.helperPath].concat(args), done: done || null })
+      _queue = q
+      _pump()
+    }
+
+    function _pump() {
+      // _current stays set until its result is handled, which can be a moment
+      // after the process itself has exited.
+      if (_current !== null || _queue.length === 0) return
+      var q = _queue.slice()
+      _current = q.shift()
+      _queue = q
+      proc.command = _current.command
+      proc.running = true
+    }
+
+    Job {
+      id: proc
+      onFinished: function(code, out, err) {
+        var job = queue._current
+        queue._current = null
+        if (job && job.done) {
+          try { job.done(code, out, err) }
+          catch (e) { console.warn("opendisplay", e) }
+        }
+        Qt.callLater(queue._pump)
+      }
+    }
+  }
+
+  // Mutating commands. Lookups (first-lines, last-error) get their own queue
+  // so they never wait behind, or hold up, a connect or a settings write.
+  HelperQueue { id: actions }
+  HelperQueue { id: lookups }
 
   Job {
     id: versionProc
@@ -680,7 +698,12 @@ Item {
   Job {
     id: statusProc
     command: [root.helperPath, "status", "--json"]
-    onFinished: function(code, out) { if (code === 0) root.applyStatus(out) }
+    onFinished: function(code, out) {
+      if (code !== 0) return
+      var runtime = Quickshell.env("XDG_RUNTIME_DIR") || ""
+      if (root.stampPath === "" && runtime !== "") root.stampPath = runtime + "/omarchy-opendisplay/changed"
+      root.applyStatus(out)
+    }
   }
 
   Job {
@@ -737,35 +760,35 @@ Item {
         if (!root.panelOpen) root.notify(root.t("notify.updated").arg(root.latest), "updated:" + root.latest)
       } else {
         root.updateState = "error"
-        root.updateMessage = Model.clampText(root.lastLine(err + "\n" + out), 160)
+        var e = Model.helperError(code)
+        root.updateMessage = Model.clampText(e.key !== "" ? root.t(e.key) : root.lastLine(err !== "" ? err : out), 160)
       }
       root.refreshVersion()
       root.scheduleStatus()
     }
   }
 
-  Job {
-    id: actionProc
-    onFinished: function(code, out, err) {
-      var job = root._current
-      root._current = null
-      if (job && job.done) {
-        try { job.done(code, out, err) }
-        catch (e) { console.warn("opendisplay", e) }
-      }
-      Qt.callLater(root.pump)
+  FileView {
+    path: root.stampPath
+    watchChanges: root.stampPath !== ""
+    printErrors: false
+    onFileChanged: {
+      reload()
+      root.scheduleStatus()
+      root.refreshConfig()
     }
   }
 
-  // One journal tail per active unit; replaced only when the set changes.
+  ListModel { id: tailModel }
+
   Instantiator {
-    model: root.tailUnits
+    model: tailModel
     delegate: Process {
-      required property string modelData
-      command: [root.helperPath, "logs", modelData]
+      required property string unit
+      command: [root.helperPath, "logs", unit]
       running: true
-      stdout: SplitParser { onRead: function(line) { root.handleLog(modelData, line) } }
-      Component.onCompleted: root.tailStarted(modelData)
+      stdout: SplitParser { onRead: function(line) { root.handleLog(unit, line) } }
+      Component.onCompleted: root.tailStarted(unit)
       Component.onDestruction: running = false
     }
   }
