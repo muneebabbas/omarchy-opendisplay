@@ -30,7 +30,16 @@ SETTINGS="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-opendisplay"
 WIFI_OFF="$SETTINGS/wifi-disabled"
 DROPIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/od-sender@.service.d"
 DROPIN="$DROPIN_DIR/omarchy-opendisplay-wifi.conf"
-RELEASE_API="https://api.github.com/repos/peetzweg/opendisplay/releases/latest"
+DEFAULT_REPO="peetzweg/opendisplay"
+REPO_RE='^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$'
+# GitHub owner/repo od-sender is checked and installed from: --repo, else
+# $OMARCHY_OPENDISPLAY_REPO, else upstream. An invalid value falls back to the
+# default; it is never interpolated into a URL or path unvalidated.
+REPO="${OMARCHY_OPENDISPLAY_REPO-}"
+set_repo() {  # <owner/repo>
+  if [[ $1 =~ $REPO_RE && $1 != */. && $1 != */.. ]]; then REPO="$1"; else REPO="$DEFAULT_REPO"; fi
+}
+set_repo "$REPO"
 CURL=(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --max-time 60)
 
 ID_RE='^[0-9A-Fa-f][0-9A-Fa-f-]{7,63}$'
@@ -123,7 +132,7 @@ require_sender() {
 sender_version() {  # <path>
   local out
   out="$(timeout 10 "$1" --version 2>/dev/null)" || return 1
-  [[ $out =~ ^od-sender\ ([0-9]+\.[0-9]+\.[0-9]+) ]] || return 1
+  [[ $out =~ ^od-sender\ ([0-9]+\.[0-9]+\.[0-9]+(-[a-z][a-z0-9]*\.[0-9]+)?)([[:space:]]|$) ]] || return 1
   printf '%s' "${BASH_REMATCH[1]}"
 }
 
@@ -478,7 +487,9 @@ fetch_release() {  # <force: 0|1>
     printf '%s' "$OMARCHY_OPENDISPLAY_RELEASE_FILE"
     return 0
   fi
-  local cached="$CACHE/release.json" etag="$CACHE/release.etag" tmp code
+  # One cache per source, so switching repos never reuses the other's answer.
+  local key="${REPO//\//_}"
+  local cached="$CACHE/release-$key.json" etag="$CACHE/release-$key.etag" tmp code
   if [[ $1 != 1 && -s $cached ]] && (( $(date +%s) - $(stat -c %Y "$cached") < 21600 )); then
     printf '%s' "$cached"
     return 0
@@ -486,7 +497,7 @@ fetch_release() {  # <force: 0|1>
   tmp="$(mktemp "$CACHE/release.XXXXXX")"
   local args=("${CURL[@]}" --max-filesize 1M -H 'Accept: application/vnd.github+json' -o "$tmp" -w '%{http_code}' --etag-save "$etag.new")
   [[ -s $cached && -s $etag ]] && args+=(--etag-compare "$etag")
-  if ! code="$("${args[@]}" "$RELEASE_API")"; then
+  if ! code="$("${args[@]}" "https://api.github.com/repos/$REPO/releases/latest")"; then
     rm -f "$tmp" "$etag.new"
     die_code 11 "Couldn't reach GitHub"
   fi
@@ -502,15 +513,18 @@ fetch_release() {  # <force: 0|1>
 
 cmd_check_update() {
   local force=0 arch file installed="" path
-  case "${1-}" in
-    "") ;;
-    --force) force=1 ;;
-    *) die_code 2 "usage: check-update [--force]" ;;
-  esac
+  while (( $# )); do
+    case "$1" in
+      --force) force=1 ;;
+      --repo) (( $# >= 2 )) || die_code 2 "usage: check-update [--force] [--repo owner/repo]"; set_repo "$2"; shift ;;
+      *) die_code 2 "usage: check-update [--force] [--repo owner/repo]" ;;
+    esac
+    shift
+  done
   arch="$(arch_name)" || die "unsupported architecture: $(uname -m)"
   file="$(fetch_release "$force")" || exit $?
   path="$(find_sender)" && installed="$(sender_version "$path")"
-  "${PY[@]}" "$UTIL" release "$file" "$arch" "${installed:-none}"
+  "${PY[@]}" "$UTIL" release "$file" "$arch" "${installed:-none}" "$REPO"
 }
 
 download() {  # <url> <dest>
@@ -557,6 +571,13 @@ install_exit() {
 
 cmd_install() {
   trap install_exit EXIT
+  while (( $# )); do
+    case "$1" in
+      --repo) (( $# >= 2 )) || die_code 2 "usage: install [--repo owner/repo]"; set_repo "$2"; shift ;;
+      *) die_code 2 "usage: install [--repo owner/repo]" ;;
+    esac
+    shift
+  done
   (( EUID != 0 )) || die "Run as your user, not root"
   mkdir -p "$CACHE" "$STATE"
   exec 7> "$STATE/install.lock"
@@ -722,8 +743,10 @@ Commands
   logs <unit>                  follow a unit's log
   list                         discover receivers
   version                      installed od-sender, as JSON
-  check-update [--force]       latest release, as JSON (cached for 6 hours)
-  install | update             install or update od-sender
+  check-update [--force] [--repo owner/repo]
+                               latest release, as JSON (cached for 6 hours per repo)
+  install | update [--repo owner/repo]
+                               install or update od-sender
   config-get                   sender.toml as JSON
   config-set [--receiver <id>] key=value...
   doctor                       run od-sender doctor in a terminal
@@ -778,7 +801,7 @@ main() {
     notify) cmd_notify "$@" ;;
     version) cmd_version ;;
     check-update) cmd_check_update "$@" ;;
-    install|update) cmd_install ;;
+    install|update) cmd_install "$@" ;;
     config-get) exec "${PY[@]}" "$CONFIG_TOOL" get --json ;;
     config-set) cmd_config_set "$@" ;;
     doctor) launch_terminal "$HERE/omarchy-opendisplay" doctor-run ;;

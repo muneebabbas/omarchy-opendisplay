@@ -603,22 +603,79 @@ check "check-update skips prereleases" bash -c '! OMARCHY_OPENDISPLAY_RELEASE_FI
 head -c 1100000 /dev/zero > "$T/rel-big.json"
 check "check-update refuses release JSON over 1 MB" bash -c '! OMARCHY_OPENDISPLAY_RELEASE_FILE="$1" "$0" check-update 2>/dev/null' "$HELPER" "$T/rel-big.json"
 
+# Release source: upstream (peetzweg/opendisplay) or a fork with -label.N tags.
+FORK=muneebabbas/opendisplay
+RF="$FIX/release-fork.json"
+fork_check() {  # <installed version> <repo> [release file]
+  FAKE_VERSION="$1" OMARCHY_OPENDISPLAY_RELEASE_FILE="${3:-$RF}" "$HELPER" check-update --repo "$2"
+}
+u="$(fork_check 1.30.3 "$FORK")"
+check "fork source: latest keeps the label" contains "$u" '"latest": "1.30.3-muneeb.1"'
+check "upstream installed + fork source: newer" contains "$u" '"newer": true'
+check "upstream installed + fork source: mismatch" contains "$u" '"sourceMismatch": true'
+check "fork source: latest channel reported" contains "$u" '"latestChannel": "muneeb"'
+check "fork source: installed channel reported" contains "$u" '"installedChannel": ""'
+check "fork source: html url is the fork's" contains "$u" '"htmlUrl": "https://github.com/muneebabbas/opendisplay/releases/tag/'
+u="$(fork_check 1.30.3-muneeb.1 "$FORK")"
+check "same fork build is not newer" contains "$u" '"newer": false'
+check "same fork build is not a mismatch" contains "$u" '"sourceMismatch": false'
+u="$(fork_check 1.30.3-muneeb.1 peetzweg/opendisplay "$FIX/release.json")"
+check "fork installed + upstream source: newer even when upstream is older" contains "$u" '"newer": true'
+check "fork installed + upstream source: mismatch" contains "$u" '"sourceMismatch": true'
+check "fork installed + upstream source: installedChannel" contains "$u" '"installedChannel": "muneeb"'
+u="$(fork_check 1.30.3-muneeb.0 "$FORK")"
+check "fork .0 installed, .1 latest: newer, same source" contains "$u" '"newer": true, "checkedAt'
+check "fork .0 installed, .1 latest: no mismatch" contains "$u" '"sourceMismatch": false'
+u="$(fork_check 1.30.3-muneeb.2 "$FORK")"
+check "fork .2 installed, .1 latest: not newer" contains "$u" '"newer": false'
+u="$(fork_check 1.30.2-muneeb.9 "$FORK")"
+check "older fork base version is newer" contains "$u" '"newer": true'
+u="$(fork_check 1.30.3-other.1 "$FORK")"
+check "another label is a mismatch" contains "$u" '"sourceMismatch": true'
+# Invalid repo setting falls back to upstream.
+for bad_repo in "nope" "a/b/c" "-x;y/z" 'a/$(id)' "a/.." "a/b c" ""; do
+  u="$(fork_check 1.30.2 "$bad_repo" "$FIX/release.json")"
+  check "invalid repo '$bad_repo' falls back to upstream" contains "$u" '"repo": "peetzweg/opendisplay"'
+done
+u="$(OMARCHY_OPENDISPLAY_REPO='bad repo' OMARCHY_OPENDISPLAY_RELEASE_FILE="$FIX/release.json" "$HELPER" check-update)"
+check "invalid env repo falls back to upstream" contains "$u" '"repo": "peetzweg/opendisplay"'
+u="$(OMARCHY_OPENDISPLAY_REPO=$FORK OMARCHY_OPENDISPLAY_RELEASE_FILE="$RF" "$HELPER" check-update)"
+check "env repo selects the fork" contains "$u" '"repo": "muneebabbas/opendisplay"'
+# Download URLs must belong to the configured repo.
+u="$(fork_check 1.30.2 peetzweg/opendisplay "$RF")"
+check "fork release under the upstream source: URLs rejected" contains "$u" '"url": null, "digest": "sha256:'
+u="$(fork_check 1.30.2 "$FORK" "$FIX/release.json")"
+check "upstream release under the fork source: URLs rejected" contains "$u" '"url": null'
+check "upstream release under the fork source: html falls back to the fork" contains "$u" '"htmlUrl": "https://github.com/muneebabbas/opendisplay/releases/latest"'
+check "check-update --repo needs a value" [ "$(code_of "$HELPER" check-update --repo)" = 2 ]
+# Version parsing in the sender.
+v="$(FAKE_VERSION=1.30.3-muneeb.1 "$HELPER" version)"
+check "version keeps the fork label" contains "$v" '"version": "1.30.3-muneeb.1"'
+
 # a fresh cache is reused without network; --force asks GitHub
 CACHE_DIR="$XDG_CACHE_HOME/omarchy-opendisplay"
 mkdir -p "$CACHE_DIR" "$T/curlfail"
 printf '#!/bin/sh\nexit 7\n' > "$T/curlfail/curl"
 chmod +x "$T/curlfail/curl"
-cp "$FIX/release.json" "$CACHE_DIR/release.json"
-touch "$CACHE_DIR/release.json"
+cp "$FIX/release.json" "$CACHE_DIR/release-peetzweg_opendisplay.json"
+touch "$CACHE_DIR/release-peetzweg_opendisplay.json"
 u="$(PATH="$T/curlfail:$PATH" "$HELPER" check-update)"
 check "check-update uses a fresh cache without network" contains "$u" '"latest": "1.30.2"'
-check "check-update reports checkedAt" contains "$u" "\"checkedAt\": $(stat -c %Y "$CACHE_DIR/release.json")"
+check "check-update reports checkedAt" contains "$u" "\"checkedAt\": $(stat -c %Y "$CACHE_DIR/release-peetzweg_opendisplay.json")"
 PATH="$T/curlfail:$PATH" "$HELPER" check-update --force >/dev/null 2>&1
 check "check-update --force asks GitHub (exit 11)" [ $? -eq 11 ]
-touch -d '7 hours ago' "$CACHE_DIR/release.json"
+touch -d '7 hours ago' "$CACHE_DIR/release-peetzweg_opendisplay.json"
 PATH="$T/curlfail:$PATH" "$HELPER" check-update >/dev/null 2>&1
 check "check-update with a stale cache asks GitHub (exit 11)" [ $? -eq 11 ]
-rm -f "$CACHE_DIR/release.json"
+rm -f "$CACHE_DIR/release-peetzweg_opendisplay.json"
+# The release cache is per repo: a fresh upstream cache is not the fork's answer.
+cp "$FIX/release.json" "$CACHE_DIR/release-peetzweg_opendisplay.json"
+PATH="$T/curlfail:$PATH" "$HELPER" check-update --repo "$FORK" >/dev/null 2>&1
+check "a fork check does not reuse upstream's cache (exit 11)" [ $? -eq 11 ]
+cp "$RF" "$CACHE_DIR/release-muneebabbas_opendisplay.json"
+u="$(PATH="$T/curlfail:$PATH" "$HELPER" check-update --repo "$FORK")"
+check "the fork's own cache is reused" contains "$u" '"latest": "1.30.3-muneeb.1"'
+rm -f "$CACHE_DIR"/release-*.json
 
 # --- shared validation corpus (tests/fixtures/validation.json) ---------------
 

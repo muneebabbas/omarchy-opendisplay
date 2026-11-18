@@ -655,7 +655,7 @@ Panel {
                     textFormat: Text.PlainText
                     width: parent.width
                     visible: !od.releaseError
-                    text: od.releaseKnown ? strings.t("firstRun.detail").arg(od.latest) : strings.t("firstRun.checking")
+                    text: od.releaseKnown ? strings.t("firstRun.detail").arg(od.latest).arg(od.releaseRepo) : strings.t("firstRun.checking")
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -916,10 +916,12 @@ Panel {
                   hasCursor: root.hasCursor("footer")
                   clickable: root.footerClickable
                   text: {
-                    if (root.footerKind === "update") return strings.t("footer.update").arg(od.latest)
+                    if (root.footerKind === "update") return od.sourceMismatch
+                      ? strings.t("footer.mismatch").arg(od.releaseRepo).arg(od.latest)
+                      : strings.t("footer.update").arg(od.latest)
                     if (root.footerKind === "updating") return strings.t("footer.updating")
                     if (root.footerKind === "updated") return strings.t("footer.updated").arg(od.updateMessage)
-                    if (root.footerKind === "pacman") return strings.t("footer.pacman")
+                    if (root.footerKind === "pacman") return od.sourceMismatch ? strings.t("footer.pacmanMismatch").arg(od.releaseRepo) : strings.t("footer.pacman")
                     if (root.footerKind === "error") return strings.t("footer.error").arg(od.updateMessage)
                     return ""
                   }

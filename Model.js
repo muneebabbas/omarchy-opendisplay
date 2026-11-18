@@ -290,6 +290,42 @@ function versionParts(v) {
   return [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10)]
 }
 
+// Strict parse of "1.30.3" or "v1.30.3-muneeb.1"; channel is "" for upstream.
+function parseVersion(v) {
+  var m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([a-z][a-z0-9]*)\.(\d+))?$/.exec(String(v || ""))
+  if (!m) return null
+  return { n: [parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10), m[5] === undefined ? 0 : parseInt(m[5], 10)], channel: m[4] || "" }
+}
+
+// Mirrors is_newer() in bin/opendisplay-util.py.
+function isNewer(installed, latest) {
+  var l = parseVersion(latest)
+  if (!l) return false
+  var i = parseVersion(installed)
+  if (!i || i.channel !== l.channel) return true
+  for (var k = 0; k < 4; k++) {
+    if (l.n[k] !== i.n[k]) return l.n[k] > i.n[k]
+  }
+  return false
+}
+
+function isSourceMismatch(installed, latest) {
+  var l = parseVersion(latest)
+  var i = parseVersion(installed)
+  return !!(l && i && i.channel !== l.channel)
+}
+
+var DEFAULT_REPO = "peetzweg/opendisplay"
+
+function validRepo(repo) {
+  var ok = typeof repo === "string" && /^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}$/.test(repo) && !/\/\.\.?$/.test(repo)
+  return ok ? repo : DEFAULT_REPO
+}
+
+function releasesLatestUrl(repo) {
+  return "https://github.com/" + validRepo(repo) + "/releases/latest"
+}
+
 function compareVersions(a, b) {
   var pa = versionParts(a)
   var pb = versionParts(b)
@@ -304,24 +340,26 @@ function compareVersions(a, b) {
 function parseVersionInfo(raw) {
   var p = parseJson(raw)
   var v = p.ok && p.value && typeof p.value === "object" ? p.value : {}
-  var version = versionParts(v.version) ? String(v.version).replace(/^v/, "") : ""
+  var version = parseVersion(v.version) ? String(v.version).replace(/^v/, "") : ""
   var managed = ["user", "package", "other"].indexOf(v.managed) !== -1 ? v.managed : "other"
   return { installed: v.installed === true && version !== "", version: version, managed: managed, path: clampText(v.path, 256) }
 }
 
-function isGithubUrl(url) {
-  return typeof url === "string" && url.length <= 512 && /^https:\/\/github\.com\/peetzweg\/opendisplay\/[A-Za-z0-9._\/-]*$/.test(url)
+function isGithubUrl(url, repo) {
+  var prefix = "https://github.com/" + validRepo(repo) + "/"
+  return typeof url === "string" && url.length <= 512 && url.indexOf(prefix) === 0
+    && /^[A-Za-z0-9._\/-]*$/.test(url.substring(prefix.length))
 }
 
-function parseUpdateInfo(raw) {
+function parseUpdateInfo(raw, repo) {
   var p = parseJson(raw)
   var v = p.ok && p.value && typeof p.value === "object" ? p.value : null
-  if (!v || !versionParts(v.latest)) return { ok: false, latest: "", newer: false, htmlUrl: "" }
+  if (!v || !parseVersion(v.latest)) return { ok: false, latest: "", newer: false, htmlUrl: "" }
   return {
     ok: true,
-    latest: String(v.latest).replace(/^v/, "").substring(0, 32),
+    latest: String(v.latest).replace(/^v/, "").substring(0, 48),
     newer: v.newer === true,
-    htmlUrl: isGithubUrl(v.htmlUrl) ? v.htmlUrl : "https://github.com/peetzweg/opendisplay/releases/latest"
+    htmlUrl: isGithubUrl(v.htmlUrl, repo) ? v.htmlUrl : releasesLatestUrl(repo)
   }
 }
 

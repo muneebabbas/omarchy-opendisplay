@@ -202,6 +202,36 @@ test("compareVersions is numeric", () => {
   eq(M.compareVersions("1.30.2", "v1.30.2"), 0)
 })
 
+test("isNewer follows the channel rules", () => {
+  eq(M.isNewer("1.30.3", "1.30.3-muneeb.1"), true)
+  eq(M.isNewer("1.30.3-muneeb.1", "1.30.2"), true)
+  eq(M.isNewer("1.30.3-muneeb.1", "1.30.3-muneeb.2"), true)
+  eq(M.isNewer("1.30.3-muneeb.2", "1.30.3-muneeb.2"), false)
+  eq(M.isNewer("1.30.3-muneeb.2", "1.30.3-muneeb.1"), false)
+  eq(M.isNewer("1.30.2", "1.30.2"), false)
+  eq(M.isNewer("1.30.1", "v1.30.2"), true)
+  eq(M.isNewer("1.31.0", "1.30.2"), false)
+  eq(M.isNewer("1.30.2", "garbage"), false)
+})
+
+test("isSourceMismatch compares channels only", () => {
+  eq(M.isSourceMismatch("1.30.3", "1.30.3-muneeb.1"), true)
+  eq(M.isSourceMismatch("1.30.3-muneeb.1", "1.30.3"), true)
+  eq(M.isSourceMismatch("1.30.3-muneeb.1", "1.30.4-muneeb.1"), false)
+  eq(M.isSourceMismatch("1.30.3", "1.30.4"), false)
+})
+
+test("releaseRepo is validated and URLs follow it", () => {
+  eq(M.validRepo("muneebabbas/opendisplay"), "muneebabbas/opendisplay")
+  for (const bad of ["", "x", "a/b/c", "a b/c", "a/..", "-x;/y", null, undefined, 5]) eq(M.validRepo(bad), "peetzweg/opendisplay")
+  eq(M.isGithubUrl("https://github.com/muneebabbas/opendisplay/releases/latest", "muneebabbas/opendisplay"), true)
+  eq(M.isGithubUrl("https://github.com/peetzweg/opendisplay/releases/latest", "muneebabbas/opendisplay"), false)
+  eq(M.isGithubUrl("https://github.com/peetzweg/opendisplay/releases/latest"), true)
+  eq(M.isGithubUrl("https://github.com/peetzweg/opendisplay-evil/releases", "peetzweg/opendisplay"), false)
+  const u = M.parseUpdateInfo('{"latest":"1.30.3-muneeb.1","newer":true,"htmlUrl":"https://github.com/peetzweg/opendisplay/x"}', "muneebabbas/opendisplay")
+  eq([u.ok, u.latest, u.htmlUrl], [true, "1.30.3-muneeb.1", "https://github.com/muneebabbas/opendisplay/releases/latest"])
+})
+
 test("version and update info are validated", () => {
   eq(M.parseVersionInfo('{"installed":true,"version":"1.30.2","path":"/x","managed":"user"}').installed, true)
   eq(M.parseVersionInfo('{"installed":false}').installed, false)

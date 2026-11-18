@@ -2,7 +2,7 @@
 """JSON-producing helpers for bin/omarchy-opendisplay. Run with python3 -I.
 
   status                                   sessions, units and auto-connect state as JSON
-  release FILE ARCH INSTALLED              check-update JSON from a GitHub release object
+  release FILE ARCH INSTALLED [REPO]       check-update JSON from a GitHub release object
   verify-sha FILE SHAFILE DIGEST           check a download against .sha256 and the API digest
   check-tar FILE TOPDIR                    reject unsafe or unexpected tarball entries
   install-plan                             status JSON on stdin -> EXTERNAL or "<kind> <unit> <to>" lines
@@ -27,7 +27,9 @@ OUTPUT_RE = re.compile(r"^od-[0-9a-f]{6}$")
 TRANSIENT_RE = re.compile(r"^opendisplay-(addr-|usb-)?[0-9a-f]{8}\.service$")
 USB_UNIT_PREFIX = "opendisplay-usb-"
 TEMPLATE_RE = re.compile(r"^od-sender@(.+)\.service$")
-VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([a-z][a-z0-9]*)\.(\d+))?$")
+REPO_RE = re.compile(r"^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$")
+DEFAULT_REPO = "peetzweg/opendisplay"
 MAX_JSON = 1024 * 1024
 # The transient units' Description is "<DESC_PREFIX><to>"; bin/omarchy-opendisplay
 # sets it (DESC_PREFIX there) and units() parses it back. Keep the two in sync.
@@ -267,9 +269,29 @@ def load_release(path):
     return rel
 
 
-def version_tuple(v):
+def parse_version(v):
+    """(major, minor, patch, build, channel) or None; channel is "" for upstream."""
     m = VERSION_RE.match(v or "")
-    return tuple(int(x) for x in m.groups()) if m else None
+    if not m:
+        return None
+    return (int(m[1]), int(m[2]), int(m[3]), int(m[5] or 0), m[4] or "")
+
+
+def version_text(t):
+    base = "{}.{}.{}".format(*t[:3])
+    return f"{base}-{t[4]}.{t[3]}" if t[4] else base
+
+
+def is_newer(installed, latest):
+    """Update offered: nothing installed, a different source, or a higher version."""
+    if installed is None or installed[4] != latest[4]:
+        return True
+    return latest[:4] > installed[:4]
+
+
+def valid_repo(repo):
+    ok = bool(REPO_RE.match(repo or "")) and not str(repo).endswith(("/.", "/.."))
+    return repo if ok else DEFAULT_REPO
 
 
 def find_asset(rel, name):
@@ -279,35 +301,43 @@ def find_asset(rel, name):
     return None
 
 
-GH_DOWNLOAD = re.compile(r"^https://github\.com/peetzweg/opendisplay/releases/download/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+def download_re(repo):
+    tail = r"/releases/download/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$"
+    return re.compile(r"^https://github\.com/" + re.escape(repo) + tail)
 
 
-def cmd_release(path, arch, installed):
+def cmd_release(path, arch, installed, repo=DEFAULT_REPO):
+    repo = valid_repo(repo)
     rel = load_release(path)
     if rel.get("draft") or rel.get("prerelease"):
         raise ValueError("latest release is a draft or prerelease")
     tag = str(rel.get("tag_name", ""))
-    latest = version_tuple(tag)
+    latest = parse_version(tag)
     if latest is None:
         raise ValueError(f"unexpected release tag {tag[:40]!r}")
     name = f"od-sender-{arch}-unknown-linux-gnu.tar.gz"
     asset = find_asset(rel, name)
     sha = find_asset(rel, name + ".sha256")
     html = str(rel.get("html_url", ""))
-    if not re.match(r"^https://github\.com/peetzweg/opendisplay/releases/", html):
-        html = "https://github.com/peetzweg/opendisplay/releases/latest"
-    cur = version_tuple(installed)
+    if not html.startswith(f"https://github.com/{repo}/releases/") or not re.match(r"^[A-Za-z0-9._:/-]+$", html):
+        html = f"https://github.com/{repo}/releases/latest"
+    cur = parse_version(installed)
     out = {
-        "latest": "{}.{}.{}".format(*latest),
+        "latest": version_text(latest),
+        "repo": repo,
+        "latestChannel": latest[4],
+        "installedChannel": cur[4] if cur else None,
+        "sourceMismatch": cur is not None and cur[4] != latest[4],
         "url": asset.get("browser_download_url") if asset else None,
         "digest": asset.get("digest") if asset else None,
         "sha256Url": sha.get("browser_download_url") if sha else None,
         "htmlUrl": html,
-        "newer": cur is None or latest > cur,
+        "newer": is_newer(cur, latest),
         "checkedAt": int(os.path.getmtime(path)),
     }
+    gh_download = download_re(repo)
     for key in ("url", "sha256Url"):
-        if out[key] is not None and not GH_DOWNLOAD.match(str(out[key])):
+        if out[key] is not None and not gh_download.match(str(out[key])):
             out[key] = None
     if out["digest"] is not None and not re.match(r"^sha256:[0-9a-f]{64}$", str(out["digest"])):
         out["digest"] = None
@@ -387,8 +417,8 @@ def main(argv):
             return 0
         if argv == ["template-installed"]:
             return 0 if template_installed() else 1
-        if argv[:1] == ["release"] and len(argv) == 4:
-            return cmd_release(argv[1], argv[2], argv[3])
+        if argv[:1] == ["release"] and len(argv) in (4, 5):
+            return cmd_release(*argv[1:])
         if argv[:1] == ["verify-sha"] and len(argv) == 4:
             return cmd_verify_sha(argv[1], argv[2], argv[3])
         if argv[:1] == ["check-tar"] and len(argv) == 3:
