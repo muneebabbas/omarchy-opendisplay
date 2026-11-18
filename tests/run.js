@@ -221,6 +221,27 @@ test("isSourceMismatch compares channels only", () => {
   eq(M.isSourceMismatch("1.30.3", "1.30.4"), false)
 })
 
+test("senderArgs: tokens are validated, any bad one voids the setting", () => {
+  eq(M.parseSenderArgs(""), { ok: true, args: [] })
+  eq(M.parseSenderArgs(undefined), { ok: true, args: [] })
+  eq(M.parseSenderArgs("   "), { ok: true, args: [] })
+  eq(M.parseSenderArgs("--encoder vaapi"), { ok: true, args: ["--encoder", "vaapi"] })
+  eq(M.parseSenderArgs("--encoder=vaapi --max-fps 60"), { ok: true, args: ["--encoder=vaapi", "--max-fps", "60"] })
+  eq(M.parseSenderArgs("  -x\t--a=b/c:d,e+f@g.h-i \n"), { ok: true, args: ["-x", "--a=b/c:d,e+f@g.h-i"] })
+  eq(M.parseSenderArgs("--flag="), { ok: true, args: ["--flag="] })
+  const bad = [
+    "--to 1.2.3.4:9000", "--to=1.2.3.4:9000", "--encoder vaapi --to=x", "-h", "--help", "--help=x", "--version", "-V",
+    "--encoder vaapi;id", "$(id)", "`id`", "'vaapi'", '"vaapi"', "a|b", "a&b", "a>b", "a<b", "a*b", "a\\b", "~", "a=b",
+    "--", "--=x", "--a=b=c", "--a=b c=d", "--a b=c", "é", "a\u0000b",
+    Array.from({ length: 17 }, (_, i) => "v" + i).join(" "),
+    "a".repeat(257),
+    5, {}, ["--encoder"],
+  ]
+  for (const b of bad) eq([typeof b === "string" ? b : String(b), M.parseSenderArgs(b)], [typeof b === "string" ? b : String(b), { ok: false, args: [] }])
+  eq(M.parseSenderArgs(Array.from({ length: 16 }, (_, i) => "v" + i).join(" ")).ok, true)
+  eq(M.parseSenderArgs("a".repeat(256)).ok, true)
+})
+
 test("releaseRepo is validated and URLs follow it", () => {
   eq(M.validRepo("muneebabbas/opendisplay"), "muneebabbas/opendisplay")
   for (const bad of ["", "x", "a/b/c", "a b/c", "a/..", "-x;/y", null, undefined, 5]) eq(M.validRepo(bad), "peetzweg/opendisplay")

@@ -185,6 +185,56 @@ reset_fake
 "$HELPER" connect-addr 10.93.10.226:9000 >/dev/null
 check "connect-addr passes --to=<addr>" grep -qx -- "--to=10.93.10.226:9000" "$FAKE/systemd-run"
 
+# --- extra od-sender arguments (--arg) ----------------------------------------
+
+sender_tail() {  # the argv after `od-sender` in the last systemd-run, one line each
+  sed -n '/^run$/,$p' "$FAKE/systemd-run" 2>/dev/null | tr '\n' ' '
+}
+reset_fake
+"$HELPER" connect "$ID" --arg --encoder --arg vaapi --arg --max-fps=60 >/dev/null
+check "connect appends --arg tokens after run --to, in order" [ "$(sender_tail)" = "run --to=$ID --encoder vaapi --max-fps=60 " ]
+reset_fake
+"$HELPER" connect-addr 10.93.10.226:9000 --arg --encoder=vaapi >/dev/null
+check "connect-addr appends --arg tokens" [ "$(sender_tail)" = "run --to=10.93.10.226:9000 --encoder=vaapi " ]
+reset_fake
+"$HELPER" connect "$ID" >/dev/null
+check "connect without --arg adds nothing" [ "$(sender_tail)" = "run --to=$ID " ]
+
+args_ignored() {  # <desc> <token>... : the whole setting is dropped, the connect still runs
+  local desc="$1" err; shift
+  local a=() t
+  for t in "$@"; do a+=(--arg "$t"); done
+  reset_fake
+  err="$("$HELPER" connect "$ID" "${a[@]}" 2>&1 >/dev/null)"
+  check "$desc: connect still starts" [ -e "$FAKE/systemd-run" ]
+  check "$desc: no extra args used" [ "$(sender_tail)" = "run --to=$ID " ]
+  check "$desc: says so on stderr" contains "$err" "ignoring extra od-sender arguments"
+}
+args_ignored "--to rejected" --encoder vaapi --to 1.2.3.4:9000
+args_ignored "--to=x rejected" --to=1.2.3.4:9000
+args_ignored "-h rejected" -h
+args_ignored "--help rejected" --help
+args_ignored "--version rejected" --version
+args_ignored "semicolon rejected" --encoder 'vaapi;id'
+args_ignored "command substitution rejected" '$(id)'
+args_ignored "backtick rejected" '`id`'
+args_ignored "double quote rejected" '"vaapi"'
+args_ignored "single quote rejected" "'vaapi'"
+args_ignored "space inside a token rejected" 'a b'
+args_ignored "newline rejected" $'a\nb'
+args_ignored "empty token rejected" ''
+args_ignored "bare -- rejected" --
+many=(); for i in $(seq 17); do many+=("v$i"); done
+args_ignored "17 tokens rejected" "${many[@]}"
+args_ignored "over 256 chars rejected" "$(printf 'a%.0s' $(seq 257))"
+reset_fake
+many=(); for i in $(seq 16); do many+=("v$i"); done
+a=(); for t in "${many[@]}"; do a+=(--arg "$t"); done
+"$HELPER" connect "$ID" "${a[@]}" >/dev/null 2>&1
+check "16 tokens are accepted" [ "$(sender_tail)" = "run --to=$ID ${many[*]} " ]
+check "--arg without a value exits 2" [ "$(code_of "$HELPER" connect "$ID" --arg)" = 2 ]
+check "connect rejects a bad id after --arg" [ "$(code_of "$HELPER" connect --arg x -rf)" = 2 ]
+
 # disconnect and restart pick the right units
 reset_fake
 set_unit "$TRANSIENT" active
@@ -387,6 +437,18 @@ check "stop escalates to SIGTERM when od-sender ignores SIGINT" grep -q TERM "$F
 check "escalation waits for SIGINT first" [ $((SECONDS - start)) -ge 4 ]
 check "run logged the refusal" grep -q "refused a local connection" "$T/run.err"
 
+# usbmux.py validates the extra arguments itself.
+for bad_extra in "--to=1.2.3.4:1" "--help" 'a;b' '$(id)'; do
+  code="$(python3 -I "$ROOT/bin/usbmux.py" run --udid="$UDID" --sender="$T/fake-sender" -- "$bad_extra" 2>/dev/null; echo $?)"
+  check "usbmux.py run rejects extra arg $bad_extra" [ "$code" = 2 ]
+done
+rm -f "$FAKE/sender-args" "$FAKE/sender-got" "$FAKE/sender-signals" "$T/connects"
+python3 -I "$ROOT/bin/usbmux.py" run --udid="$UDID" --sender="$T/fake-sender" -- --encoder vaapi 2>"$T/run2.err" &
+RUN_PID=$!
+for _ in $(seq 100); do [[ -e $FAKE/sender-args ]] && break; sleep 0.1; done
+check "usbmux.py run appends the extra args to od-sender" [ "$(sed -n '3,$p' "$FAKE/sender-args" | tr '\n' ' ')" = "--encoder vaapi " ]
+kill -TERM "$RUN_PID"; wait "$RUN_PID" 2>/dev/null
+
 reset_fake
 set_unit "$TEMPLATE" active
 "$HELPER" connect-usb "$ID" >/dev/null
@@ -404,6 +466,17 @@ check "connect-usb doesn't disable auto-connect" bash -c '! grep -q " disable " 
 rm -f "$FAKE/systemd-run"
 "$HELPER" connect-usb "$ID" >/dev/null
 check "connect-usb is a no-op when the usb unit is active" [ ! -e "$FAKE/systemd-run" ]
+reset_fake
+"$HELPER" connect-usb "$ID" --arg --encoder --arg vaapi >/dev/null
+check "connect-usb passes --arg tokens to usbmux.py after --" bash -c '[[ $(tr "\n" " " < "$0") == *"--sender=/"*" -- --encoder vaapi "* ]]' "$FAKE/systemd-run"
+reset_fake
+"$HELPER" connect-usb "$ID" --arg '--to=1.2.3.4:1' >/dev/null 2>&1
+check "connect-usb with an invalid arg runs with none" bash -c '[[ $(tr "\n" " " < "$0") == *"--sender=/"*" -- " ]]' "$FAKE/systemd-run"
+reset_fake
+"$HELPER" connect-usb "$ID" >/dev/null
+check "connect-usb without --arg passes none" bash -c '[[ $(tr "\n" " " < "$0") == *"--sender=/"*" -- " ]]' "$FAKE/systemd-run"
+set_unit "$USB_UNIT" active
+rm -f "$FAKE/systemd-run"
 check "connect (Wi-Fi) is a no-op while a USB session runs" bash -c '"$0" connect "$1" | grep -q "already connected" && [ ! -e "$2" ]' "$HELPER" "$ID" "$FAKE/systemd-run"
 s="$("$HELPER" status)"
 check "status marks the usb unit's transport" contains "$s" '"transport": "usb"'
@@ -827,6 +900,11 @@ check "a failing install.sh restarts the stopped session" [ -e "$FAKE/systemd-ru
 check "the restarted session is active again" [ "$(cat "$FAKE/units/$TRANSIENT")" = active ]
 check "a failing install.sh still stamps the change" [ "$(cat "$XDG_RUNTIME_DIR/omarchy-opendisplay/changed")" != 5 ]
 check "a failing install.sh leaves no temp dirs" bash -c '! ls -d "$0"/install.* 2>/dev/null' "$XDG_CACHE_HOME/omarchy-opendisplay"
+reset_fake
+"$HELPER" connect "$ID" >/dev/null
+rm -f "$FAKE/systemd-run"
+OMARCHY_OPENDISPLAY_RELEASE_FILE="$T/release.json" OMARCHY_OPENDISPLAY_DOWNLOAD_DIR="$DL" "$HELPER" install --arg --encoder --arg vaapi >/dev/null 2>&1
+check "install's restore keeps the --arg tokens" [ "$(sender_tail)" = "run --to=$ID --encoder vaapi " ]
 reset_fake
 
 # pacman-managed installs are information only.

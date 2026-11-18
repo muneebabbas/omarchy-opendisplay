@@ -322,6 +322,32 @@ function validRepo(repo) {
   return ok ? repo : DEFAULT_REPO
 }
 
+// Extra od-sender arguments (the `senderArgs` setting): whitespace-separated
+// tokens, no quoting or escapes, never a shell. Mirrored in bin/omarchy-opendisplay
+// and bin/usbmux.py; keep the three in step. Anything invalid voids the whole
+// setting: {ok: false, args: []}. An empty setting is ok with no args.
+var SENDER_ARGS_MAX_TOKENS = 16
+var SENDER_ARGS_MAX_CHARS = 256
+
+function parseSenderArgs(raw) {
+  var none = { ok: true, args: [] }
+  if (raw === undefined || raw === null || raw === "") return none
+  var bad = { ok: false, args: [] }
+  if (typeof raw !== "string" || raw.length > SENDER_ARGS_MAX_CHARS) return bad
+  var tokens = raw.split(/[ \t\n\r]+/).filter(function(t) { return t !== "" })
+  if (tokens.length > SENDER_ARGS_MAX_TOKENS) return bad
+  for (var i = 0; i < tokens.length; i++) {
+    var t = tokens[i]
+    var isOpt = /^--?[A-Za-z0-9][A-Za-z0-9-]*(=[A-Za-z0-9._:,\/+@-]*)?$/.test(t)
+    if (!isOpt && (t === "--" || !/^[A-Za-z0-9._:,\/+@-]+$/.test(t))) return bad
+    if (isOpt) {
+      var name = t.split("=")[0]
+      if (name === "--" || name === "--to" || name === "-h" || name === "--help" || name === "--version" || name === "-V") return bad
+    }
+  }
+  return { ok: true, args: tokens }
+}
+
 function releasesLatestUrl(repo) {
   return "https://github.com/" + validRepo(repo) + "/releases/latest"
 }
