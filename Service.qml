@@ -38,6 +38,7 @@ Item {
     latest = ""
     releaseKnown = false
     releaseError = false
+    releaseMissing = false
     htmlUrl = Model.releasesLatestUrl(releaseRepo)
     updateRecheck.restart()
   }
@@ -56,6 +57,8 @@ Item {
   property string htmlUrl: Model.releasesLatestUrl(Model.DEFAULT_REPO)
   property bool releaseKnown: false
   property bool releaseError: false
+  // The selected repo answered but has no published release (helper exit 15).
+  property bool releaseMissing: false
   readonly property bool updateAvailable: installed && latest !== "" && Model.isNewer(version, latest)
   // The installed build comes from a different source than the selected one.
   readonly property bool sourceMismatch: installed && latest !== "" && Model.isSourceMismatch(version, latest)
@@ -849,8 +852,10 @@ Item {
         root.htmlUrl = u.htmlUrl
         root.releaseKnown = true
         root.releaseError = false
+        root.releaseMissing = false
       } else {
         root.releaseError = true
+        root.releaseMissing = code === 15
       }
     }
   }

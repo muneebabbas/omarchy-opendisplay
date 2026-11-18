@@ -879,6 +879,7 @@ function helperError(code) {
   if (code === 12) return { key: "error.wifiOff", doctor: false }
   if (code === 13) return { key: "error.usbmuxd", doctor: false }
   if (code === 14) return { key: "error.notOnUsb", doctor: false }
+  if (code === 15) return { key: "error.noRelease", doctor: false }
   return { key: "", doctor: false }
 }
 
