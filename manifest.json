@@ -14,9 +14,10 @@
     "category": "Display",
     "allowMultiple": false,
     "defaultSection": "right",
-    "defaults": { "checkUpdates": true },
+    "defaults": { "checkUpdates": true, "releaseRepo": "peetzweg/opendisplay" },
     "schema": [
-      { "key": "checkUpdates", "type": "boolean", "label": "Check GitHub daily for od-sender updates", "defaultValue": true }
+      { "key": "checkUpdates", "type": "boolean", "label": "Check GitHub daily for od-sender updates", "defaultValue": true },
+      { "key": "releaseRepo", "type": "string", "label": "od-sender release source (GitHub owner/repo)", "defaultValue": "peetzweg/opendisplay" }
     ]
   }
 }

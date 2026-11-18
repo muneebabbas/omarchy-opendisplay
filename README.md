@@ -1,6 +1,6 @@
 # OpenDisplay for Omarchy
 
-An Omarchy bar widget around the official [OpenDisplay](https://github.com/peetzweg/opendisplay) Linux sender, `od-sender`. Extend your desktop onto an iPad, iPhone, Android device or Mac, over Wi-Fi or USB (iPad and iPhone): discover receivers, connect in one click, pick a quality preset, and keep `od-sender` installed and up to date from its GitHub releases.
+An Omarchy bar widget around the official [OpenDisplay](https://github.com/peetzweg/opendisplay) Linux sender, `od-sender`. Extend your desktop onto an iPad, iPhone, Android device or Mac, over Wi-Fi or USB (iPad and iPhone): discover receivers, connect in one click, pick a quality preset, and keep `od-sender` installed and up to date from its GitHub releases (upstream by default, or a fork you choose).
 
 It does not reimplement the OpenDisplay protocol. Everything goes through the `od-sender` CLI.
 
@@ -54,6 +54,7 @@ With Wi-Fi off and nothing plugged in, the panel offers **Turn on Wi-Fi**.
 In the bar's widget settings:
 
 - **Check GitHub daily for od-sender updates** (on by default)
+- **od-sender release source (GitHub owner/repo)** (default `peetzweg/opendisplay`): where od-sender is checked and installed from. Set it to a fork such as `muneebabbas/opendisplay` to use that fork's releases. Fork tags look like `v1.30.3-muneeb.1` (`od-sender --version` prints `od-sender 1.30.3-muneeb.1`), as normal releases with the same asset names. If the installed od-sender comes from a different source than the selected one, the panel footer says so and offers to install the selected source's version; switch the setting back and the same offer installs the other build. Anything that isn't a valid `owner/repo` falls back to upstream. Each source has its own release cache, so changing it checks right away.
 
 ### Keyboard and IPC
 
@@ -105,7 +106,7 @@ Over USB, `bin/usbmux.py` reads the receiver's first message (its hello: id, dev
 
 ## Security notes
 
-- **Downloads are checksum-verified, not signed.** An install or update only runs after the tarball's SHA-256 matches both the release's `.sha256` file and the digest GitHub's API reports for that asset; it aborts if either is missing or different. The archive is also checked for absolute paths, `..`, links and device files before it's unpacked. This proves the file is the one GitHub published for that release. It isn't a signature, because upstream doesn't sign releases, so you are trusting the peetzweg/opendisplay GitHub account. Updates never install by themselves; you always click.
+- **Downloads are checksum-verified, not signed.** An install or update only runs after the tarball's SHA-256 matches both the release's `.sha256` file and the digest GitHub's API reports for that asset; it aborts if either is missing or different. The archive is also checked for absolute paths, `..`, links and device files before it's unpacked. This proves the file is the one GitHub published for that release. It isn't a signature, because upstream doesn't sign releases, so you are trusting the GitHub account that owns the selected release source (peetzweg/opendisplay by default). Updates never install by themselves; you always click.
 - **OpenDisplay is plain TCP with no encryption or pairing.** Anyone on the network path can see the stream, and any receiver that answers can be connected to. Use it on networks you trust, or over Tailscale.
 - Receiver names, log lines and release data are treated as untrusted. They're length-limited and always shown as plain text.
 - Auto-connect is off by default and only turned on by you, per receiver. It's LAN-only: `od-sender run --wait` doesn't try Tailscale peers.
@@ -179,7 +180,7 @@ omarchy plugin enable io.github.muneebabbas.opendisplay   # first time only
 - Sessions run in systemd, so a connected display survives the restart.
 - Shell log: `journalctl --user -t omarchy-shell -f`.
 
-The helper also works on its own, which is handy for debugging: `bin/omarchy-opendisplay status`, `list`, `usb-list`, `wifi status`, `version`, `check-update`, `config-get` and so on (`bin/omarchy-opendisplay help`). For acceptance testing an update, `OMARCHY_OPENDISPLAY_RELEASE_FILE=<release.json>` points `check-update` and `install` at a local release object instead of GitHub.
+The helper also works on its own, which is handy for debugging: `bin/omarchy-opendisplay status`, `list`, `usb-list`, `wifi status`, `version`, `check-update`, `config-get` and so on (`bin/omarchy-opendisplay help`). For acceptance testing an update, `check-update` and `install` take `--repo owner/repo` (or `OMARCHY_OPENDISPLAY_REPO`); `OMARCHY_OPENDISPLAY_RELEASE_FILE=<release.json>` points `check-update` and `install` at a local release object instead of GitHub.
 
 `docs/SPEC.md` is the design spec, including the manual acceptance tests.
 

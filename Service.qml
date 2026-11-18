@@ -18,6 +18,20 @@ Item {
   property var strings: null
   property bool panelOpen: false
   readonly property bool checkUpdates: setting("checkUpdates", true) !== false
+  // GitHub owner/repo od-sender is installed from; invalid values mean upstream.
+  readonly property string releaseRepo: Model.validRepo(setting("releaseRepo", Model.DEFAULT_REPO))
+  // The repo the current `latest`/`htmlUrl` belong to.
+  property string latestRepo: ""
+  onReleaseRepoChanged: {
+    // A different source: drop the other repo's answer and re-check now.
+    if (latestRepo === releaseRepo) return
+    latest = ""
+    releaseKnown = false
+    releaseError = false
+    htmlUrl = Model.releasesLatestUrl(releaseRepo)
+    updateRecheck.restart()
+  }
+  Timer { id: updateRecheck; interval: 400; onTriggered: root.checkUpdate(false, true) }
 
   signal receiverUsed(string id, string name, string addr, double when)
 
@@ -29,10 +43,12 @@ Item {
   property string version: ""
   property string managed: ""
   property string latest: ""
-  property string htmlUrl: "https://github.com/peetzweg/opendisplay/releases/latest"
+  property string htmlUrl: Model.releasesLatestUrl(Model.DEFAULT_REPO)
   property bool releaseKnown: false
   property bool releaseError: false
-  readonly property bool updateAvailable: installed && latest !== "" && Model.compareVersions(version, latest) < 0
+  readonly property bool updateAvailable: installed && latest !== "" && Model.isNewer(version, latest)
+  // The installed build comes from a different source than the selected one.
+  readonly property bool sourceMismatch: installed && latest !== "" && Model.isSourceMismatch(version, latest)
   // "" | "updating" | "updated" | "error"
   property string updateState: ""
   property string updateMessage: ""
@@ -196,13 +212,22 @@ Item {
     })
   }
 
-  function checkUpdate(force) {
-    if (updateProc.pending) return
+  // `sourceChanged`: the repo setting just changed, so run even when a check is
+  // pending (its answer is dropped as stale) and use the other repo's cache.
+  function checkUpdate(force, sourceChanged) {
+    if (updateProc.pending) {
+      if (sourceChanged === true) updateRecheck.restart()
+      return
+    }
     // The first-run card needs the release; otherwise honor the setting.
     if (installed && !checkUpdates && force !== true) return
     lastUpdateCheckMs = Date.now()
-    // Without --force the helper answers from its cache when it is under 6 h old.
-    updateProc.command = force === true ? [helperPath, "check-update", "--force"] : [helperPath, "check-update"]
+    // Without --force the helper answers from its cache (kept per repo) when it is under 6 h old.
+    var cmd = [helperPath, "check-update"]
+    if (force === true) cmd.push("--force")
+    cmd.push("--repo", releaseRepo)
+    updateProc.requestedRepo = releaseRepo
+    updateProc.command = cmd
     updateProc.running = true
   }
 
@@ -561,6 +586,7 @@ Item {
     clearError()
     updateState = "updating"
     updateMessage = ""
+    installProc.command = [helperPath, "install", "--repo", releaseRepo]
     installProc.running = true
   }
 
@@ -573,7 +599,7 @@ Item {
   }
   function openDetails() { Quickshell.execDetached([helperPath, "details"]) }
   function openRelease() {
-    var url = Model.isGithubUrl(htmlUrl) ? htmlUrl : "https://github.com/peetzweg/opendisplay/releases/latest"
+    var url = Model.isGithubUrl(htmlUrl, releaseRepo) ? htmlUrl : Model.releasesLatestUrl(releaseRepo)
     Quickshell.execDetached(["omarchy-launch-browser", url])
   }
 
@@ -799,10 +825,14 @@ Item {
 
   Job {
     id: updateProc
+    property string requestedRepo: ""
     command: [root.helperPath, "check-update"]
     onFinished: function(code, out) {
-      var u = Model.parseUpdateInfo(out)
+      // The source changed while this ran: its answer is for the other repo.
+      if (requestedRepo !== root.releaseRepo) { updateRecheck.restart(); return }
+      var u = Model.parseUpdateInfo(out, requestedRepo)
       if (code === 0 && u.ok) {
+        root.latestRepo = requestedRepo
         root.latest = u.latest
         root.htmlUrl = u.htmlUrl
         root.releaseKnown = true
