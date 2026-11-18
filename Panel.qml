@@ -644,7 +644,7 @@ Panel {
                   Text {
                     textFormat: Text.PlainText
                     width: parent.width
-                    text: od.releaseError ? strings.t("firstRun.offline") : strings.t("firstRun.title")
+                    text: od.releaseError ? (od.releaseMissing ? strings.t("firstRun.noRelease").arg(od.releaseRepo) : strings.t("firstRun.offline")) : strings.t("firstRun.title")
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
@@ -917,11 +917,11 @@ Panel {
                   clickable: root.footerClickable
                   text: {
                     if (root.footerKind === "update") return od.sourceMismatch
-                      ? strings.t("footer.mismatch").arg(od.releaseRepo).arg(od.latest)
+                      ? strings.t("footer.mismatch").arg(od.latest)
                       : strings.t("footer.update").arg(od.latest)
                     if (root.footerKind === "updating") return strings.t("footer.updating")
                     if (root.footerKind === "updated") return strings.t("footer.updated").arg(od.updateMessage)
-                    if (root.footerKind === "pacman") return od.sourceMismatch ? strings.t("footer.pacmanMismatch").arg(od.releaseRepo) : strings.t("footer.pacman")
+                    if (root.footerKind === "pacman") return strings.t("footer.pacman")
                     if (root.footerKind === "error") return strings.t("footer.error").arg(od.updateMessage)
                     return ""
                   }
@@ -944,6 +944,19 @@ Panel {
                   }
                 }
               }
+            }
+
+            // Why the update link is there when the installed build comes from
+            // another repo; its own line, as the footer row is too narrow.
+            Text {
+              visible: od.sourceMismatch && (root.footerKind === "update" || root.footerKind === "pacman")
+              width: parent.width
+              textFormat: Text.PlainText
+              wrapMode: Text.WordWrap
+              text: strings.t("footer.mismatchNote").arg(od.releaseRepo)
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
           }
         }

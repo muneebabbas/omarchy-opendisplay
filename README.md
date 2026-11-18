@@ -164,7 +164,7 @@ CI (`.github/workflows/ci.yml`) runs on every push to `main` and every pull requ
 
 ### Helper exit codes
 
-The helper's exit codes are part of its contract with the widget (for example 2 for an invalid argument, 8 when od-sender isn't installed, 11 when GitHub can't be reached, 12 when Wi-Fi connections are off, 13 when usbmuxd isn't available, 14 when a receiver isn't plugged in). Run `bin/omarchy-opendisplay help` for the full list.
+The helper's exit codes are part of its contract with the widget (for example 2 for an invalid argument, 8 when od-sender isn't installed, 11 when GitHub can't be reached, 12 when Wi-Fi connections are off, 13 when usbmuxd isn't available, 14 when a receiver isn't plugged in, 15 when the selected release repo has no published release). Run `bin/omarchy-opendisplay help` for the full list.
 
 ### Trying changes in the shell
 

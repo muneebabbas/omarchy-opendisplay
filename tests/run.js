@@ -612,7 +612,7 @@ test("scaleChange passthrough depends on the top-level scale", () => {
 
 test("helperError maps exit codes to i18n keys", () => {
   const want = { 2: ["error.invalidValue", false], 5: ["error.cantRun", true], 6: ["error.rejected", true], 7: ["error.autoConnectUnit", false],
-    8: ["error.notInstalled", false], 9: ["error.externalSender", false], 10: ["error.packageManaged", false], 11: ["error.offline", false] }
+    8: ["error.notInstalled", false], 9: ["error.externalSender", false], 10: ["error.packageManaged", false], 11: ["error.offline", false], 15: ["error.noRelease", false] }
   for (const code of Object.keys(want)) eq(M.helperError(Number(code)), { key: want[code][0], doctor: want[code][1] })
   eq(M.helperError(1), { key: "", doctor: false })
   eq(M.helperError(undefined), { key: "", doctor: false })

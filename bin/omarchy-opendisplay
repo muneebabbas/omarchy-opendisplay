@@ -543,6 +543,8 @@ fetch_release() {  # <force: 0|1>
   [[ -s $cached && -s $etag ]] && args+=(--etag-compare "$etag")
   if ! code="$("${args[@]}" "https://api.github.com/repos/$REPO/releases/latest")"; then
     rm -f "$tmp" "$etag.new"
+    # GitHub answers 404 for a repo with no published release (or no repo).
+    [[ $code == 404 ]] && die_code 15 "No od-sender release found in $REPO"
     die_code 11 "Couldn't reach GitHub"
   fi
   if [[ $code == 304 ]]; then
@@ -676,7 +678,7 @@ cmd_install() {
     [[ -n ${unit-} ]] && valid_unit "$unit" && stop_units "$unit"
   done <<< "$PLAN"
 
-  echo "Running the official install.sh"
+  echo "Running the release's install.sh (from $REPO)"
   ( cd "$tmp/x/$top" && bash ./install.sh ) || die "install.sh failed"
 
   SENDER="$(find_sender)" || die "od-sender isn't on PATH after installing"
@@ -820,6 +822,7 @@ Exit codes
   12  connect refused: Wi-Fi connections are turned off
   13  USB needs usbmuxd, which isn't running or installed
   14  the receiver isn't connected by USB (or its app isn't open)
+  15  the selected repo has no published release
 EOF
 }
 

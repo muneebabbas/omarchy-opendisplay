@@ -748,6 +748,13 @@ check "a fork check does not reuse upstream's cache (exit 11)" [ $? -eq 11 ]
 cp "$RF" "$CACHE_DIR/release-muneebabbas_opendisplay.json"
 u="$(PATH="$T/curlfail:$PATH" "$HELPER" check-update --repo "$FORK")"
 check "the fork's own cache is reused" contains "$u" '"latest": "1.30.3-muneeb.1"'
+# A repo with no published release: GitHub answers 404 (curl -f exits 22).
+mkdir -p "$T/curl404"
+printf '#!/bin/sh\nprintf 404\nexit 22\n' > "$T/curl404/curl"
+chmod +x "$T/curl404/curl"
+err="$(PATH="$T/curl404:$PATH" "$HELPER" check-update --force --repo "$FORK" 2>&1 >/dev/null)"; rc=$?
+check "a repo without a release exits 15, not 'offline'" [ "$rc" -eq 15 ]
+check "a repo without a release names the repo" contains "$err" "No od-sender release found in $FORK"
 rm -f "$CACHE_DIR"/release-*.json
 
 # --- shared validation corpus (tests/fixtures/validation.json) ---------------
