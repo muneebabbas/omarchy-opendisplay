@@ -40,6 +40,47 @@ set_repo() {  # <owner/repo>
   if [[ $1 =~ $REPO_RE && $1 != */. && $1 != */.. ]]; then REPO="$1"; else REPO="$DEFAULT_REPO"; fi
 }
 set_repo "$REPO"
+# Extra od-sender arguments for sessions started here: repeated `--arg <token>`
+# on connect, connect-addr, connect-usb and install (whose restores reuse them).
+# Whitespace-free tokens, never a shell; the same rules as Model.parseSenderArgs
+# and usbmux.py. One invalid token voids all of them, with a note on stderr.
+SENDER_ARGS=()
+SENDER_ARG_OPT_RE='^--?[A-Za-z0-9][A-Za-z0-9-]*(=[A-Za-z0-9._:,/+@-]*)?$'
+SENDER_ARG_VAL_RE='^[A-Za-z0-9._:,/+@-]+$'
+set_sender_args() {  # <token>...
+  local t name joined="$*"
+  SENDER_ARGS=()
+  (( $# == 0 )) && return 0
+  if (( $# > 16 || ${#joined} > 256 )); then
+    echo "ignoring extra od-sender arguments: too many" >&2; return 0
+  fi
+  for t in "$@"; do
+    if [[ $t =~ $SENDER_ARG_OPT_RE ]]; then
+      name="${t%%=*}"
+      case "$name" in
+        --to|-h|--help|--version|-V) echo "ignoring extra od-sender arguments: $name isn't allowed" >&2; return 0 ;;
+      esac
+    elif [[ $t == -- || ! $t =~ $SENDER_ARG_VAL_RE ]]; then
+      echo "ignoring extra od-sender arguments: invalid token" >&2; return 0
+    fi
+  done
+  SENDER_ARGS=("$@")
+}
+# Parses `[--arg <token>]... <rest>`: sets SENDER_ARGS and REST (the others).
+parse_arg_opts() {
+  local toks=()
+  REST=()
+  while (( $# )); do
+    if [[ $1 == --arg ]]; then
+      (( $# >= 2 )) || die_code 2 "--arg needs a value"
+      toks+=("$2"); shift 2
+    else
+      REST+=("$1"); shift
+    fi
+  done
+  set_sender_args "${toks[@]}"
+}
+
 CURL=(curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --max-time 60)
 
 ID_RE='^[0-9A-Fa-f][0-9A-Fa-f-]{7,63}$'
@@ -163,7 +204,7 @@ print("" if v is None else (str(v).lower() if isinstance(v, bool) else v))' "$1"
 
 # --- sessions ---------------------------------------------------------------
 
-start_transient() {  # <unit> <to>
+start_transient() {  # <unit> <to>  (extra args: $SENDER_ARGS)
   local unit="$1" to="$2"
   # Every network connect goes through here, including restores after an update.
   wifi_enabled || { echo "Wi-Fi connections are turned off" >&2; return 12; }
@@ -172,7 +213,7 @@ start_transient() {  # <unit> <to>
     failed) systemctl --user reset-failed -- "$unit" 2>/dev/null ;;
   esac
   systemd-run --user --quiet --unit="$unit" --description="$DESC_PREFIX$to" \
-    --setenv=NO_COLOR=1 --property=Restart=no -- "$SENDER" run --to="$to" \
+    --setenv=NO_COLOR=1 --property=Restart=no -- "$SENDER" run --to="$to" "${SENDER_ARGS[@]}" \
     || { echo "couldn't start $unit" >&2; return 1; }
   echo "$unit"
 }
@@ -184,6 +225,7 @@ require_wifi() {
 }
 
 cmd_connect() {
+  parse_arg_opts "$@"; set -- "${REST[@]}"
   need_id "${1-}"
   local id="$1"
   require_wifi
@@ -195,6 +237,7 @@ cmd_connect() {
 }
 
 cmd_connect_addr() {
+  parse_arg_opts "$@"; set -- "${REST[@]}"
   valid_addr "${1-}" || die_code 2 "invalid address; use host:port"
   require_wifi
   require_sender
@@ -244,12 +287,13 @@ start_usb() {  # <id>
   local tpl
   tpl="$(template_unit "$id")"
   if unit_active "$tpl"; then stop_units "$tpl"; fi
-  systemd-run "${args[@]}" -- "$py" -I "$USBMUX" run --udid="$udid" --sender="$SENDER" \
+  systemd-run "${args[@]}" -- "$py" -I "$USBMUX" run --udid="$udid" --sender="$SENDER" -- "${SENDER_ARGS[@]}" \
     || { echo "couldn't start $unit" >&2; return 1; }
   echo "$unit"
 }
 
 cmd_connect_usb() {
+  parse_arg_opts "$@"; set -- "${REST[@]}"
   need_id "${1-}"
   local id="$1" rc=0
   require_sender
@@ -570,14 +614,17 @@ install_exit() {
 }
 
 cmd_install() {
+  local install_args=()
   trap install_exit EXIT
   while (( $# )); do
     case "$1" in
-      --repo) (( $# >= 2 )) || die_code 2 "usage: install [--repo owner/repo]"; set_repo "$2"; shift ;;
-      *) die_code 2 "usage: install [--repo owner/repo]" ;;
+      --repo) (( $# >= 2 )) || die_code 2 "usage: install [--repo owner/repo] [--arg <token>]..."; set_repo "$2"; shift ;;
+      --arg) (( $# >= 2 )) || die_code 2 "usage: install [--repo owner/repo] [--arg <token>]..."; install_args+=("$2"); shift ;;
+      *) die_code 2 "usage: install [--repo owner/repo] [--arg <token>]..." ;;
     esac
     shift
   done
+  set_sender_args "${install_args[@]}"
   (( EUID != 0 )) || die "Run as your user, not root"
   mkdir -p "$CACHE" "$STATE"
   exec 7> "$STATE/install.lock"
@@ -731,9 +778,11 @@ usage() {
 usage: omarchy-opendisplay <command> [args]
 
 Commands
-  connect <id>                 connect a receiver
-  connect-addr <host:port>     connect by address
-  connect-usb <id>             connect a receiver plugged in by USB (needs usbmuxd)
+  connect <id> [--arg <tok>]...             connect a receiver
+  connect-addr <host:port> [--arg <tok>]... connect by address
+  connect-usb <id> [--arg <tok>]...         connect a receiver plugged in by USB (needs usbmuxd)
+                               --arg adds one extra od-sender argument after
+                               `run --to=...` (plain tokens only; see README)
   usb-list                     receivers on USB, as JSON
   wifi on|off|status           allow or block Wi-Fi connections and scanning
   disconnect <id|unit>         stop a session
@@ -745,7 +794,7 @@ Commands
   version                      installed od-sender, as JSON
   check-update [--force] [--repo owner/repo]
                                latest release, as JSON (cached for 6 hours per repo)
-  install | update [--repo owner/repo]
+  install | update [--repo owner/repo] [--arg <tok>]...
                                install or update od-sender
   config-get                   sender.toml as JSON
   config-set [--receiver <id>] key=value...

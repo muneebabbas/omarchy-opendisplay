@@ -14,10 +14,11 @@
     "category": "Display",
     "allowMultiple": false,
     "defaultSection": "right",
-    "defaults": { "checkUpdates": true, "releaseRepo": "peetzweg/opendisplay" },
+    "defaults": { "checkUpdates": true, "releaseRepo": "peetzweg/opendisplay", "senderArgs": "" },
     "schema": [
       { "key": "checkUpdates", "type": "boolean", "label": "Check GitHub daily for od-sender updates", "defaultValue": true },
-      { "key": "releaseRepo", "type": "string", "label": "od-sender release source (GitHub owner/repo)", "defaultValue": "peetzweg/opendisplay" }
+      { "key": "releaseRepo", "type": "string", "label": "od-sender release source (GitHub owner/repo)", "defaultValue": "peetzweg/opendisplay" },
+      { "key": "senderArgs", "type": "string", "label": "Extra od-sender arguments (e.g. --encoder vaapi)", "defaultValue": "" }
     ]
   }
 }

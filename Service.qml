@@ -20,6 +20,16 @@ Item {
   readonly property bool checkUpdates: setting("checkUpdates", true) !== false
   // GitHub owner/repo od-sender is installed from; invalid values mean upstream.
   readonly property string releaseRepo: Model.validRepo(setting("releaseRepo", Model.DEFAULT_REPO))
+  // Extra od-sender arguments for sessions this plugin starts; read on every
+  // connect, so a change applies to the next one. Invalid means none.
+  readonly property var senderArgs: Model.parseSenderArgs(setting("senderArgs", ""))
+  function senderArgv() {
+    var out = []
+    for (var i = 0; i < senderArgs.args.length; i++) out.push("--arg", senderArgs.args[i])
+    return out
+  }
+  // Tell the user the setting is being ignored; the connect goes ahead without it.
+  function noteSenderArgs() { if (!senderArgs.ok) setError("error.senderArgs") }
   // The repo the current `latest`/`htmlUrl` belong to.
   property string latestRepo: ""
   onReleaseRepoChanged: {
@@ -392,7 +402,8 @@ Item {
     p[id.toUpperCase()] = { id: id, since: Date.now(), via: route }
     _pending = p
     rebuild()
-    actions.enqueue([route === "usb" ? "connect-usb" : "connect", id], function(code, out, err) {
+    noteSenderArgs()
+    actions.enqueue([route === "usb" ? "connect-usb" : "connect", id].concat(senderArgv()), function(code, out, err) {
       if (code !== 0) {
         forgetPending(id)
         handleHelperError(code, out, err)
@@ -408,7 +419,8 @@ Item {
     var a = String(addr || "").trim()
     if (!Model.isValidAddr(a)) { setError("error.invalidAddr"); return false }
     clearError()
-    actions.enqueue(["connect-addr", a], function(code, out, err) {
+    noteSenderArgs()
+    actions.enqueue(["connect-addr", a].concat(senderArgv()), function(code, out, err) {
       if (code !== 0) handleHelperError(code, out, err)
       else {
         var unit = lastLine(out)
@@ -586,7 +598,7 @@ Item {
     clearError()
     updateState = "updating"
     updateMessage = ""
-    installProc.command = [helperPath, "install", "--repo", releaseRepo]
+    installProc.command = [helperPath, "install", "--repo", releaseRepo].concat(senderArgv())
     installProc.running = true
   }
 

@@ -10,7 +10,8 @@ connecting to a loopback port that this script forwards to the device.
   find ID                       print the UDID of the USB device whose receiver has this id
   state                         running | installed | missing
   forward --listen H:P --udid U forward a loopback port to the device (debugging)
-  run --udid U --sender PATH    forward a free loopback port, run `od-sender run --to=127.0.0.1:<port>`
+  run --udid U --sender PATH [-- ARG...]
+                                forward a free loopback port, run `od-sender run --to=127.0.0.1:<port>`
                                 as a child, stop it when the device goes away; exits with its code
 
 Exit codes: 0 ok, 1 other failure, 2 bad usage, 3 the device isn't on USB (run),
@@ -435,9 +436,31 @@ def cmd_forward(addr, udid):
     return 0
 
 
-def cmd_run(udid, sender):
+# Extra od-sender arguments (after `--`), validated like Model.parseSenderArgs
+# and the helper; they are only ever passed as argv, never through a shell.
+_ARG_OPT = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9-]*(=[A-Za-z0-9._:,/+@-]*)?")
+_ARG_VAL = re.compile(r"[A-Za-z0-9._:,/+@-]+")
+_ARG_DENIED = ("--", "--to", "-h", "--help", "--version", "-V")
+
+
+def valid_extra_args(args):
+    if len(args) > 16 or len(" ".join(args)) > 256:
+        return False
+    for a in args:
+        if _ARG_OPT.fullmatch(a):
+            if a.split("=", 1)[0] in _ARG_DENIED:
+                return False
+        elif a == "--" or not _ARG_VAL.fullmatch(a):
+            return False
+    return True
+
+
+def cmd_run(udid, sender, extra=()):
     if not os.path.isabs(sender) or not os.access(sender, os.X_OK):
         print("--sender must be the absolute path of od-sender", file=sys.stderr)
+        return 2
+    if not valid_extra_args(list(extra)):
+        print("invalid extra od-sender arguments", file=sys.stderr)
         return 2
     did = device_for(udid)
     if did is None:
@@ -445,7 +468,7 @@ def cmd_run(udid, sender):
         return 3
     listener = listen("127.0.0.1", 0)
     port = listener.getsockname()[1]
-    child = subprocess.Popen([sender, "run", f"--to=127.0.0.1:{port}"])
+    child = subprocess.Popen([sender, "run", f"--to=127.0.0.1:{port}", *extra])
     # Only od-sender's own connections are forwarded.
     threading.Thread(target=accept_loop, args=(listener, did, peer_is(child.pid)), daemon=True).start()
     stopping = threading.Event()
@@ -501,6 +524,10 @@ def opt(argv, name):
 
 def main(argv):
     cmd = argv[:1]
+    extra = []
+    if cmd == ["run"] and "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
     try:
         if argv == ["list"] or argv == ["list", "--json"]:
             return cmd_list()
@@ -516,7 +543,7 @@ def main(argv):
                 return 2
             if cmd == ["forward"]:
                 return cmd_forward(opt(argv, "--listen") or "", udid)
-            return cmd_run(udid, opt(argv, "--sender") or "")
+            return cmd_run(udid, opt(argv, "--sender") or "", extra)
     except Unavailable:
         print("usbmuxd isn't running", file=sys.stderr)
         return 13
